@@ -1,0 +1,59 @@
+name: Daily Spike Prediction
+
+on:
+  # Option 1: GitHub cron (may delay 15-60 min)
+  # Runs at 7:00 AM ET (12:00 UTC) Mon-Fri to account for delay
+  schedule:
+    - cron: "0 12 * * 1-5"
+
+  # Option 2: External trigger (exact timing via cron-job.org or similar)
+  workflow_dispatch:
+
+jobs:
+  predict:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download saved model
+        # The model files are stored as a GitHub Actions artifact from the last retrain
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: spike-model
+          path: data/
+          search_artifacts: true
+          if_no_artifact_found: fail
+
+      - name: Run prediction
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python spike_detector.py
+
+      - name: Send Telegram alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python notify.py
+
+      - name: Save watchlist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchlist-${{ github.run_id }}
+          path: output/
+          retention-days: 90

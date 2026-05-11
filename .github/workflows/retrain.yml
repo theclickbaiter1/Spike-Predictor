@@ -1,0 +1,42 @@
+name: Retrain Model
+
+on:
+  # Run manually, or schedule weekly on Sunday
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * 0"  # Sunday 6 AM ET (10:00 UTC)
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Retrain model
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python spike_detector.py --retrain
+
+      - name: Upload model artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: spike-model
+          path: |
+            data/model_s1.json
+            data/model_s2.json
+            data/model_meta.json
+          retention-days: 365
