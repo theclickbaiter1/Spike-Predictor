@@ -88,17 +88,20 @@ def run_retrain():
     client = FinnhubClient()
     scorer = FinBERTScorer()
 
-    X, y = build_training_dataset(UNIVERSE, client, scorer)
+    X, y, intraday_ret = build_training_dataset(UNIVERSE, client, scorer)
 
     training_df = X.copy()
     training_df["_target"] = y
+    training_df["_intraday_return"] = intraday_ret
     training_df.to_parquet(TRAINING_DATA_PATH)
     print(f"\n  Training data saved to {TRAINING_DATA_PATH}")
 
     X_train, y_train, X_val, y_val = time_series_split(X, y)
+    ret_train = intraday_ret.iloc[:len(X_train)]
+    ret_val = intraday_ret.iloc[len(X_train):]
 
     model = TwoStageModel()
-    model.train(X_train, y_train, X_val, y_val)
+    model.train(X_train, y_train, X_val, y_val, ret_train, ret_val)
 
     print("\n  Top 10 Spike Detection Feature Importances:")
     importance = model.get_spike_feature_importance()
@@ -106,7 +109,7 @@ def run_retrain():
         bar = "█" * int(score * 100)
         print(f"    {feat:30s} {score:.3f} {bar}")
 
-    model.retrain_full(X, y)
+    model.retrain_full(X, y, intraday_ret)
     model.save()
 
     print("\n  ✅ Retraining complete.")

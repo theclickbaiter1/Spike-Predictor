@@ -5,9 +5,7 @@ Usage:
     FINNHUB_API_KEY="your_key" python3.13 validate_today.py
 """
 import os
-os.environ["FINNHUB_API_KEY"] = os.environ.get(
-    "FINNHUB_API_KEY", "d7t5en1r01qugn09ehh0d7t5en1r01qugn09ehhg"
-)
+os.environ["FINNHUB_API_KEY"] = os.environ.get("FINNHUB_API_KEY", "")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import matplotlib
