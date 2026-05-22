@@ -41,22 +41,35 @@ jobs:
           search_artifacts: true
           if_no_artifact_found: fail
 
-      - name: Run predictions + place paper trades
+      - name: Run predictions (generate watchlist)
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python predict/spike_detector.py
+
+      - name: Send prediction watchlist to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python predict/notify.py
+
+      - name: Place paper trades
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
         run: python predict/trade.py --paper
 
-      - name: Send Telegram alert
+      - name: Send trade confirmations to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python predict/notify.py --trades
 
-      - name: Save trade log artifact
+      - name: Save artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: trade-log-${{ github.run_id }}
-          path: output/trade_log.csv
+          name: daily-output-${{ github.run_id }}
+          path: output/
           retention-days: 365
