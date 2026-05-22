@@ -30,6 +30,13 @@ jobs:
           key: spike-data-cache-${{ github.run_id }}
           restore-keys: spike-data-cache-
 
+      - name: Cache Telegram subscribers
+        uses: actions/cache@v4
+        with:
+          path: data/subscribers.json
+          key: telegram-subscribers-${{ github.run_id }}
+          restore-keys: telegram-subscribers-
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 

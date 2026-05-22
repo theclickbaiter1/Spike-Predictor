@@ -1,9 +1,21 @@
 """
-notify.py — Send spike detector watchlist to Telegram.
+notify.py — Send spike detector messages to all Telegram subscribers.
+
+Subscribers are anyone who has sent /start to the bot. The owner (whose
+chat_id is set as TELEGRAM_CHAT_ID in env) is always included. Subscribers
+are persisted in data/subscribers.json, cached across GitHub Actions runs.
+
+Each notify.py invocation:
+  1. Polls Telegram getUpdates for new /start (or /stop) commands
+  2. Registers/unregisters chat_ids; sends a welcome reply to new subscribers
+  3. Sends the requested message to all current subscribers + owner
 
 Usage:
     python predict/notify.py                        # Send today's watchlist
-    python predict/notify.py --file output/watchlist_YYYY-MM-DD.csv
+    python predict/notify.py --trades               # Trade confirmations
+    python predict/notify.py --validate             # Validation summary
+    python predict/notify.py --file <path>          # Custom watchlist CSV
+    python predict/notify.py --poll-only            # Just register /start; send no message
 """
 
 import sys
@@ -11,29 +23,149 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import argparse
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 
 import requests
 
-from config import OUTPUT_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADE_LOG_PATH
+from config import DATA_DIR, OUTPUT_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADE_LOG_PATH
+
+SUBSCRIBERS_PATH = DATA_DIR / "subscribers.json"
+
+
+# ── Subscriber persistence ───────────────────────────────────────────────────
+
+def load_subscribers() -> dict:
+    if not SUBSCRIBERS_PATH.exists():
+        return {"last_update_id": 0, "subscribers": []}
+    try:
+        with open(SUBSCRIBERS_PATH) as f:
+            state = json.load(f)
+        state.setdefault("last_update_id", 0)
+        state.setdefault("subscribers", [])
+        return state
+    except Exception as e:
+        print(f"  ! Failed to read {SUBSCRIBERS_PATH}: {e} — starting fresh.")
+        return {"last_update_id": 0, "subscribers": []}
+
+
+def save_subscribers(state: dict):
+    SUBSCRIBERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(SUBSCRIBERS_PATH, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+# ── Low-level Telegram I/O ───────────────────────────────────────────────────
+
+def _send(chat_id, text: str, markdown: bool = True) -> bool:
+    if not TELEGRAM_BOT_TOKEN:
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {"chat_id": chat_id, "text": text}
+    if markdown:
+        payload["parse_mode"] = "Markdown"
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        if not resp.ok:
+            print(f"  ! Send to {chat_id} failed: {resp.status_code} {resp.text[:200]}")
+        return resp.ok
+    except Exception as e:
+        print(f"  ! Send to {chat_id} exception: {e}")
+        return False
+
+
+def poll_and_register() -> dict:
+    """Call getUpdates; register /start senders, remove /stop senders."""
+    state = load_subscribers()
+    if not TELEGRAM_BOT_TOKEN:
+        return state
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {
+        "offset": state["last_update_id"] + 1,
+        "timeout": 0,
+        "allowed_updates": json.dumps(["message"]),
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        data = resp.json() if resp.ok else None
+    except Exception as e:
+        print(f"  ! getUpdates exception: {e}")
+        return state
+
+    if not data or not data.get("ok"):
+        print(f"  ! getUpdates not-ok: {data}")
+        return state
+
+    subs_by_id = {s["chat_id"]: s for s in state["subscribers"]}
+    new_count = 0
+    removed_count = 0
+
+    for upd in data.get("result", []):
+        state["last_update_id"] = max(state["last_update_id"], upd["update_id"])
+        msg = upd.get("message") or {}
+        text = (msg.get("text") or "").strip()
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        if not chat_id:
+            continue
+
+        if text.startswith("/start"):
+            if chat_id not in subs_by_id:
+                sub = {
+                    "chat_id": chat_id,
+                    "first_name": chat.get("first_name", ""),
+                    "username": chat.get("username", ""),
+                    "subscribed_at": datetime.now(timezone.utc).isoformat(),
+                }
+                subs_by_id[chat_id] = sub
+                new_count += 1
+                # Welcome message (plain text to avoid Markdown escaping issues with names)
+                _send(
+                    chat_id,
+                    f"Welcome{(' ' + sub['first_name']) if sub['first_name'] else ''}! "
+                    f"You're subscribed to Spike Detector alerts.\n\n"
+                    f"You'll receive:\n"
+                    f"• 9:15 AM ET — daily watchlist + paper trade confirmations\n"
+                    f"• 4:30 PM ET — post-market validation summary\n\n"
+                    f"Send /stop to unsubscribe at any time.",
+                    markdown=False,
+                )
+
+        elif text.startswith("/stop"):
+            if chat_id in subs_by_id:
+                del subs_by_id[chat_id]
+                removed_count += 1
+                _send(chat_id, "You've been unsubscribed. Send /start to resubscribe.", markdown=False)
+
+    state["subscribers"] = list(subs_by_id.values())
+    save_subscribers(state)
+
+    if new_count or removed_count:
+        print(f"  Subscriber changes: +{new_count} new, -{removed_count} removed. Total: {len(state['subscribers'])}.")
+    return state
 
 
 def send_telegram(text: str):
+    """Poll for new subscribers, then broadcast `text` to owner + all subscribers."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("ERROR: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set.")
         sys.exit(1)
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(url, json={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "Markdown",
-    })
+    state = poll_and_register()
 
-    if resp.ok:
-        print("Telegram message sent.")
-    else:
-        print(f"Telegram send failed: {resp.status_code} {resp.text}")
+    # Owner is always a recipient (even if they never /start'd the bot)
+    recipients = {int(TELEGRAM_CHAT_ID)}
+    for s in state["subscribers"]:
+        recipients.add(int(s["chat_id"]))
+
+    sent = 0
+    for chat_id in recipients:
+        if _send(chat_id, text, markdown=True):
+            sent += 1
+
+    print(f"Telegram broadcast: {sent}/{len(recipients)} recipient(s) reached.")
+    if sent == 0:
         sys.exit(1)
 
 
@@ -158,7 +290,14 @@ def main():
                         help="Send trade execution summary instead of watchlist")
     parser.add_argument("--validate", action="store_true",
                         help="Send daily validation summary instead of watchlist")
+    parser.add_argument("--poll-only", action="store_true",
+                        help="Poll for /start and /stop commands; do not send any broadcast")
     args = parser.parse_args()
+
+    if args.poll_only:
+        state = poll_and_register()
+        print(f"Subscribers: {len(state['subscribers'])}")
+        return
 
     if args.validate:
         msg = format_validation_summary()

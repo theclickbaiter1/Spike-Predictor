@@ -33,6 +33,13 @@ jobs:
           key: validation-state-${{ github.run_id }}
           restore-keys: validation-state-
 
+      - name: Cache Telegram subscribers
+        uses: actions/cache@v4
+        with:
+          path: data/subscribers.json
+          key: telegram-subscribers-${{ github.run_id }}
+          restore-keys: telegram-subscribers-
+
       - name: Download today's watchlist (from daily_trade run)
         uses: dawidd6/action-download-artifact@v3
         with:
