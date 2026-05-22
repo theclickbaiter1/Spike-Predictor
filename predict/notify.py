@@ -108,12 +108,62 @@ def format_trade_summary(csv_path: str = None) -> str:
     return "\n".join(lines)
 
 
+def format_validation_summary(metrics_csv: str = None) -> str:
+    """Format the latest validation metrics + rolling trend for Telegram."""
+    import pandas as pd
+
+    path = Path(metrics_csv) if metrics_csv else (OUTPUT_DIR / "validation_state" / "metrics.csv")
+    if not path.exists():
+        return "*Validation* — No metrics yet (first run?)."
+
+    df = pd.read_csv(path)
+    if df.empty:
+        return "*Validation* — No metrics yet."
+
+    df = df.sort_values("date").reset_index(drop=True)
+    today = df.iloc[-1]
+    n = int(today["n_tickers"])
+
+    lines = [f"*Validation — {today['date']}*\n"]
+    lines.append(f"📊 Accuracy: *{today['accuracy']*100:.1f}%* ({int(today['accuracy']*n)}/{n})")
+    lines.append(f"🎯 Spike precision: *{today['spike_precision']*100:.0f}%* "
+                 f"({int(today['n_pred_spikes'])} predicted)")
+    lines.append(f"🔍 Spike recall: *{today['spike_recall']*100:.0f}%* "
+                 f"({int(today['n_actual_spikes'])} actual)")
+    lines.append(f"↕️ Direction acc: *{today['direction_accuracy']*100:.0f}%* (on caught spikes)")
+
+    pnl_today = today["long_signal_return"] + today["short_signal_return"]
+    pnl_emoji = "🟢" if pnl_today >= 0 else "🔴"
+    lines.append(f"{pnl_emoji} Signal P&L: *{pnl_today*100:+.2f}%* "
+                 f"(L {today['long_signal_return']*100:+.2f}% / S {today['short_signal_return']*100:+.2f}%)")
+
+    # Rolling 10-day trend
+    if len(df) >= 5:
+        recent = df.tail(10)
+        cum_pnl = (df["long_signal_return"].fillna(0) + df["short_signal_return"].fillna(0)).sum() * 100
+        lines.append("")
+        lines.append(f"📈 *{len(recent)}d avg:* "
+                     f"acc {recent['accuracy'].mean()*100:.1f}%, "
+                     f"prec {recent['spike_precision'].mean()*100:.0f}%, "
+                     f"rec {recent['spike_recall'].mean()*100:.0f}%")
+        lines.append(f"💰 Cumulative signal P&L ({len(df)}d): *{cum_pnl:+.1f}%*")
+
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--file", type=str, help="Path to watchlist CSV")
     parser.add_argument("--trades", action="store_true",
                         help="Send trade execution summary instead of watchlist")
+    parser.add_argument("--validate", action="store_true",
+                        help="Send daily validation summary instead of watchlist")
     args = parser.parse_args()
+
+    if args.validate:
+        msg = format_validation_summary()
+        send_telegram(msg)
+        return
 
     if args.trades:
         msg = format_trade_summary()

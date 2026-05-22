@@ -1,0 +1,74 @@
+name: Daily Validation
+
+on:
+  # Triggered by Cloudflare Worker cron at 4:30 PM ET, or manual dispatch
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set ET date
+        id: et_date
+        run: echo "today=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: Restore validation state (rolling history + metrics + chart)
+        uses: actions/cache@v4
+        with:
+          path: output/validation_state
+          key: validation-state-${{ github.run_id }}
+          restore-keys: validation-state-
+
+      - name: Download today's watchlist (from daily_trade run)
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: watchlist-${{ steps.et_date.outputs.today }}
+          path: output/
+          workflow: daily_trade.yml
+          workflow_conclusion: ""
+          search_artifacts: true
+          if_no_artifact_found: warn
+
+      - name: Run validation
+        run: python backtest/daily_validation.py
+
+      - name: Send Telegram summary
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python predict/notify.py --validate
+
+      - name: Upload validation state as artifact (browsable)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validation-${{ steps.et_date.outputs.today }}
+          path: output/validation_state/
+          retention-days: 365
+          if-no-files-found: warn
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d parse_mode=Markdown \
+            -d text="*Validation* — daily_validate.yml failed for ${{ steps.et_date.outputs.today }}. Check run ${{ github.run_id }}."

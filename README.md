@@ -22,8 +22,8 @@ Every trading day at **9:15 AM ET** (15 minutes before the open), the pipeline:
 
 ```mermaid
 flowchart TB
-    subgraph Schedule["Scheduling"]
-        CF[Cloudflare Worker Cron<br/>9:15 AM ET, Mon-Fri]
+    subgraph Schedule["Scheduling (DST-aware)"]
+        CF[Cloudflare Worker Cron<br/>9:15 AM ET trade<br/>4:30 PM ET validate<br/>7:00 AM Sun retrain]
     end
 
     subgraph Ingest["Data Sources"]
@@ -47,13 +47,19 @@ flowchart TB
 
     subgraph Output["Output Channels"]
         WL[Ranked Watchlist<br/>output/watchlist_YYYY-MM-DD.csv]
-        TG[Telegram Alert<br/>watchlist + trade confirmations]
+        TG[Telegram Alerts<br/>watchlist + trades + validation]
         ORD[Alpaca Bracket Orders<br/>market entry, TP +5%, SL -3%]
     end
 
-    CF -->|workflow_dispatch| GHA[GitHub Actions<br/>daily_trade.yml]
-    GHA --> FH
-    GHA --> YF
+    subgraph Feedback["Feedback Loop"]
+        VAL[Daily Validation 4:30 PM ET<br/>pred vs actual + rolling metrics<br/>+ trend chart]
+        HIST[(validation_state/<br/>history.csv, metrics.csv,<br/>trend.png — cached across runs)]
+    end
+
+    CF -->|9:15 AM trade dispatch| GTRADE[GHA daily_trade.yml]
+    CF -->|4:30 PM validate dispatch| GVAL[GHA daily_validate.yml]
+    GTRADE --> FH
+    GTRADE --> YF
     FH --> SEN
     YF --> TECH
     YF --> MACRO
@@ -69,6 +75,10 @@ flowchart TB
     WL --> TG
     WL -->|P_spike >= 0.40| ORD
     AL --> ORD
+    WL -.->|stable-named artifact| GVAL
+    GVAL --> VAL
+    VAL --> HIST
+    VAL --> TG
 ```
 
 ## Repo Layout
@@ -85,16 +95,18 @@ flowchart TB
 │   ├── notify.py          # Telegram alerts (watchlist + trade confirmations)
 │   └── run_daily.sh       # Wrapper used by GitHub Actions
 ├── backtest/
-│   ├── backtest.py        # Historical model performance
-│   ├── backtest_strategy.py  # Strategy backtest with TP/SL
-│   ├── validate_today.py  # Out-of-sample validation against today's actuals
-│   └── validate_week.py   # Week-over-week validation
+│   ├── backtest.py            # Historical model performance
+│   ├── backtest_strategy.py   # Strategy backtest with TP/SL
+│   ├── daily_validation.py    # Lightweight daily pred-vs-actual + rolling metrics
+│   ├── validate_today.py      # Full retrain-and-validate for a single date
+│   └── validate_week.py       # Full retrain-and-validate for a date range
 ├── data/                  # Cached news, earnings, OHLCV, trained model
 ├── output/                # Daily watchlists, trade logs, validation reports
 └── .github/workflows/
-    ├── daily_predict.yml  # Prediction-only run (no trades)
-    ├── daily_trade.yml    # Prediction + Alpaca paper trades
-    └── retrain.yml        # Weekly model retrain
+    ├── daily_predict.yml   # Prediction-only run (no trades)
+    ├── daily_trade.yml     # Prediction + Alpaca paper trades (9:15 AM ET)
+    ├── daily_validate.yml  # Post-market pred-vs-actual (4:30 PM ET)
+    └── retrain.yml         # Weekly model retrain (Sun 7 AM ET)
 ```
 
 ## Quick Start
@@ -230,19 +242,34 @@ Alpaca handles bracket exits server-side, so no intraday monitoring process is n
 
 ### Cloudflare Worker → GitHub Actions
 
-A Cloudflare Worker cron fires at **9:15 AM ET on weekdays** and triggers GitHub Actions workflows via `workflow_dispatch`. Three workflows live in `.github/workflows/`:
+A Cloudflare Worker cron triggers GitHub Actions workflows via `workflow_dispatch`. The Worker is **DST-aware** — it schedules two crons per slot (one for EDT, one for EST) and only dispatches when NY local time matches the intended slot, so the schedule survives DST changes without manual intervention.
 
-- **`daily_predict.yml`** — Predictions only (no trades), sends watchlist to Telegram
-- **`daily_trade.yml`** — Predictions + paper trades + Telegram confirmations (the production daily run)
-- **`retrain.yml`** — Weekly model retrain, uploads model artifact for the daily runs to download
+| Slot (ET) | Workflow | Purpose |
+|---|---|---|
+| Mon–Fri 9:15 AM | `daily_trade.yml` | Predictions + paper trades + Telegram |
+| Mon–Fri 4:30 PM | `daily_validate.yml` | Pred-vs-actual + rolling metrics + Telegram |
+| Sunday 7:00 AM | `retrain.yml` | Weekly model retrain |
+
+`daily_predict.yml` also exists for prediction-only manual runs (no trades).
 
 Required GitHub Secrets: `FINNHUB_API_KEY`, `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
 
+### Validation Feedback Loop
+
+After market close each weekday, `daily_validation.py` downloads the morning's watchlist (stable-named artifact `watchlist-YYYY-MM-DD`), pulls actual intraday returns via yfinance, and appends to a rolling state cached across runs:
+
+- `output/validation_state/history.csv` — per-ticker per-day prediction vs actual
+- `output/validation_state/metrics.csv` — per-day aggregate metrics (accuracy, precision, recall, direction accuracy, signal P&L proxy)
+- `output/validation_state/trend.png` — 4-panel chart showing how each metric evolves over time
+
+The Telegram summary surfaces today's numbers plus a 10-day rolling average and cumulative signal P&L. The cache key is `validation-state-<run_id>` with `restore-keys: validation-state-`, so each run pulls the latest snapshot, appends today, and saves a new version.
+
 ### Telegram
 
-Two notifications per run:
-1. **Prediction watchlist** — sent right after `spike_detector.py` finishes
-2. **Trade confirmations** — sent after `trade.py` places orders
+Three notifications per trading day:
+1. **9:15 AM** — Prediction watchlist (from `spike_detector.py`)
+2. **9:15 AM** — Trade confirmations (from `trade.py`)
+3. **4:30 PM** — Validation summary (from `daily_validation.py`)
 
 ## Recent Changes
 

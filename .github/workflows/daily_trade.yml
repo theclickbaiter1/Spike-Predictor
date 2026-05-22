@@ -67,6 +67,19 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python predict/notify.py --trades
 
+      - name: Set ET date
+        id: et_date
+        run: echo "today=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: Save watchlist (stable name for validation pickup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: watchlist-${{ steps.et_date.outputs.today }}
+          path: output/watchlist_*.csv
+          retention-days: 90
+          if-no-files-found: warn
+
       - name: Save artifacts
         uses: actions/upload-artifact@v4
         with:
