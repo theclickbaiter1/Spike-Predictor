@@ -38,6 +38,8 @@ jobs:
         with:
           name: spike-model
           path: data/
+          workflow: retrain.yml
+          workflow_conclusion: success
           search_artifacts: true
           if_no_artifact_found: fail
 
