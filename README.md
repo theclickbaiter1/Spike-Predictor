@@ -242,7 +242,7 @@ Alpaca handles bracket exits server-side, so no intraday monitoring process is n
 
 ### Cloudflare Worker → GitHub Actions
 
-A Cloudflare Worker cron triggers GitHub Actions workflows via `workflow_dispatch`. The Worker is **DST-aware** — it schedules two crons per slot (one for EDT, one for EST) and only dispatches when NY local time matches the intended slot, so the schedule survives DST changes without manual intervention.
+A Cloudflare Worker cron triggers GitHub Actions workflows via `workflow_dispatch`. The Worker is **DST-aware and holiday-aware** — it schedules two crons per slot (one for EDT, one for EST), dispatches only when NY local time matches the intended slot, and skips weekday slots on NYSE market holidays. The holiday list lives in `worker.js` and needs annual update against [nyse.com/markets/hours-calendars](https://www.nyse.com/markets/hours-calendars). Sunday retrain runs regardless (uses historical data only).
 
 | Slot (ET) | Workflow | Purpose |
 |---|---|---|
