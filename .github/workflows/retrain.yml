@@ -1,10 +1,8 @@
 name: Retrain Model
 
 on:
-  # Run manually, or schedule weekly on Sunday
+  # Triggered by Cloudflare Worker cron (weekly) or manual dispatch
   workflow_dispatch:
-  schedule:
-    - cron: "0 10 * * 0"  # Sunday 6 AM ET (10:00 UTC)
 
 jobs:
   retrain:
@@ -21,6 +19,15 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      - name: Cache news + earnings data
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/news_cache
+            data/earnings_cache
+          key: spike-data-cache-${{ github.run_id }}
+          restore-keys: spike-data-cache-
+
       - name: Install dependencies
         run: pip install -r requirements.txt
 
@@ -29,7 +36,7 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python spike_detector.py --retrain
+        run: python predict/spike_detector.py --retrain
 
       - name: Upload model artifact
         uses: actions/upload-artifact@v4

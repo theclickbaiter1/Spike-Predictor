@@ -1,11 +1,11 @@
-name: Daily Spike Prediction
+name: Daily Trading
 
 on:
   # Triggered by Cloudflare Worker cron or manual dispatch
   workflow_dispatch:
 
 jobs:
-  predict:
+  trade:
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -41,22 +41,22 @@ jobs:
           search_artifacts: true
           if_no_artifact_found: fail
 
-      - name: Run prediction
+      - name: Run predictions + place paper trades
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python predict/spike_detector.py
+        run: python predict/trade.py --paper
 
       - name: Send Telegram alert
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python predict/notify.py
+        run: python predict/notify.py --trades
 
-      - name: Save watchlist artifact
+      - name: Save trade log artifact
         uses: actions/upload-artifact@v4
         with:
-          name: watchlist-${{ github.run_id }}
-          path: output/
-          retention-days: 90
+          name: trade-log-${{ github.run_id }}
+          path: output/trade_log.csv
+          retention-days: 365

@@ -2,22 +2,20 @@
 notify.py — Send spike detector watchlist to Telegram.
 
 Usage:
-    python notify.py                        # Send today's watchlist
-    python notify.py --file output/watchlist_2026-05-06.csv
+    python predict/notify.py                        # Send today's watchlist
+    python predict/notify.py --file output/watchlist_YYYY-MM-DD.csv
 """
 
-import argparse
-import os
 import sys
-from datetime import datetime
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import argparse
+from datetime import datetime
 
 import requests
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+from config import OUTPUT_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADE_LOG_PATH
 
 
 def send_telegram(text: str):
@@ -73,10 +71,54 @@ def format_watchlist(csv_path: str) -> str:
     return "\n".join(lines)
 
 
+def format_trade_summary(csv_path: str = None) -> str:
+    """Format today's trades from trade_log.csv for Telegram."""
+    import pandas as pd
+
+    path = Path(csv_path) if csv_path else TRADE_LOG_PATH
+    if not path.exists():
+        return "*Spike Trader* — No trade log found."
+
+    df = pd.read_csv(path)
+    if df.empty:
+        return "*Spike Trader* — No trades recorded."
+
+    # Filter to today's trades
+    today = datetime.now().strftime("%Y-%m-%d")
+    df_today = df[df["date"] == today]
+
+    if df_today.empty:
+        return f"*Spike Trader — {today}*\n\n📭 No trades placed today."
+
+    lines = [f"*Spike Trader — {today}*\n"]
+    lines.append(f"📊 *{len(df_today)} orders placed*\n")
+
+    for _, t in df_today.iterrows():
+        d = "▲" if t["direction"] == "LONG" else "▼"
+        lines.append(
+            f"  `{t['ticker']:<6}` {d} {t['direction']}  "
+            f"{t['qty']} shares @ ${t['entry_price']:.2f}\n"
+            f"        TP=${t['take_profit']:.2f}  SL=${t['stop_loss']:.2f}  "
+            f"P(spike)={t['p_spike']*100:.0f}%"
+        )
+
+    mode = df_today.iloc[0].get("mode", "unknown")
+    lines.append(f"\n_Mode: {mode}_")
+
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--file", type=str, help="Path to watchlist CSV")
+    parser.add_argument("--trades", action="store_true",
+                        help="Send trade execution summary instead of watchlist")
     args = parser.parse_args()
+
+    if args.trades:
+        msg = format_trade_summary()
+        send_telegram(msg)
+        return
 
     if args.file:
         csv_path = args.file

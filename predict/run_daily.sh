@@ -4,7 +4,8 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")"
+# Always run from project root regardless of where this script lives
+cd "$(dirname "$(dirname "$0")")"
 
 echo "=== Spike Detector Daily Run ==="
 echo "Date: $(date)"
@@ -13,9 +14,9 @@ echo "Date: $(date)"
 pip install -q -r requirements.txt
 
 # Run prediction
-python spike_detector.py
+python predict/spike_detector.py
 
 # Send Telegram notification
-python notify.py
+python predict/notify.py
 
 echo "=== Done ==="

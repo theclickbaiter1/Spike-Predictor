@@ -21,10 +21,9 @@ from config import (
 )
 
 # Stage 1 sees all features except realized_vol_20d.
-# vol_z_score (relative volatility) remains — it captures regime shifts.
-# realized_vol_20d just tells the model "this is a volatile stock" which
-# inflates spike probability for every volatile ticker every day.
-S1_FEATURE_COLUMNS = [c for c in FEATURE_COLUMNS if c != "realized_vol_20d"]
+# realized_vol_20d inflates spike probability for every volatile ticker.
+_S1_EXCLUDE = {"realized_vol_20d"}
+S1_FEATURE_COLUMNS = [c for c in FEATURE_COLUMNS if c not in _S1_EXCLUDE]
 
 
 def time_series_split(X, y, val_frac=VAL_FRACTION):

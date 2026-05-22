@@ -18,6 +18,7 @@ from config import (
     ADAPTIVE_MULTIPLIER,
     EARNINGS_CACHE_DIR,
     FEATURE_COLUMNS,
+    FINNHUB_API_KEY,
     LABEL_MAP,
     SECTOR_MAP,
     SPIKE_THRESHOLD,
@@ -100,6 +101,12 @@ def _download_safe(ticker: str, start: str, end: str) -> pd.DataFrame:
         data = yf.download(ticker, start=start, end=end, progress=False)
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.droplevel(1)
+        if data.empty:
+            # yfinance occasionally fails on specific start dates — nudge by 1 day
+            alt_start = (pd.Timestamp(start) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+            data = yf.download(ticker, start=alt_start, end=end, progress=False)
+            if isinstance(data.columns, pd.MultiIndex):
+                data.columns = data.columns.droplevel(1)
         return data
     except Exception as e:
         print(f"  ⚠ yfinance download failed for {ticker}: {e}")
@@ -158,6 +165,52 @@ def compute_macro_features(trading_dates, start_date, end_date):
     else:
         macro["sp500_5d_return"] = np.nan
 
+    # ── Lagged macro features (multi-day momentum / regime context) ──────────
+    # Single-day snapshots miss sustained macro moves. These rolling features
+    # let the model see "VIX has been elevated for days" vs a one-day blip.
+
+    if not vix_data.empty:
+        vix_close = vix_data["Close"].reindex(trading_dates, method="ffill")
+        macro["vix_change_3d"] = vix_close.pct_change(3).shift(1)
+        macro["vix_change_5d"] = vix_close.pct_change(5).shift(1)
+        vix_mean20 = vix_close.rolling(20, min_periods=10).mean()
+        vix_std20 = vix_close.rolling(20, min_periods=10).std()
+        macro["vix_regime"] = ((vix_close - vix_mean20) / vix_std20.replace(0, np.nan)).shift(1)
+    else:
+        macro["vix_change_3d"] = np.nan
+        macro["vix_change_5d"] = np.nan
+        macro["vix_regime"] = np.nan
+
+    if not dxy_data.empty:
+        dxy_close = dxy_data["Close"].reindex(trading_dates, method="ffill")
+        macro["dxy_change_5d"] = dxy_close.pct_change(5).shift(1)
+    else:
+        macro["dxy_change_5d"] = np.nan
+
+    if not oil_data.empty:
+        oil_close = oil_data["Close"].reindex(trading_dates, method="ffill")
+        macro["crude_oil_change_5d"] = oil_close.pct_change(5).shift(1)
+    else:
+        macro["crude_oil_change_5d"] = np.nan
+
+    if not gold_data.empty:
+        gold_close = gold_data["Close"].reindex(trading_dates, method="ffill")
+        macro["gold_change_5d"] = gold_close.pct_change(5).shift(1)
+    else:
+        macro["gold_change_5d"] = np.nan
+
+    if not tnx_data.empty:
+        tnx_close = tnx_data["Close"].reindex(trading_dates, method="ffill")
+        macro["treasury_10y_delta_5d"] = (tnx_close - tnx_close.shift(5)).shift(1)
+    else:
+        macro["treasury_10y_delta_5d"] = np.nan
+
+    if not spy_data.empty:
+        spy_close = spy_data["Close"].reindex(trading_dates, method="ffill")
+        macro["sp500_return_3d"] = spy_close.pct_change(3).shift(1)
+    else:
+        macro["sp500_return_3d"] = np.nan
+
     return macro
 
 
@@ -175,36 +228,51 @@ def compute_calendar_features(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFr
     cal["day_of_week"] = dates.dayofweek
     cal["is_monday"] = (dates.dayofweek == 0).astype(int)
     cal["is_friday"] = (dates.dayofweek == 4).astype(int)
-    cal["days_to_earnings"] = -1
+    cal["days_to_earnings"] = 90  # Default: "no known upcoming earnings"
     cal["is_earnings_day"] = 0
 
+    # Use cached earnings data (reliable) instead of yfinance earnings_dates (flaky).
+    # The cache has actual historical earnings dates from _fetch_earnings_data().
+    earnings_data = _fetch_earnings_data(ticker)
+    earnings_dates_list = []
+    for rec in earnings_data:
+        try:
+            earnings_dates_list.append(pd.Timestamp(rec["date"]).normalize())
+        except Exception:
+            continue
+
+    # Also try yfinance for future earnings dates not yet in cache
     try:
         t = yf.Ticker(ticker)
-        earnings_dates = None
         if hasattr(t, "earnings_dates") and t.earnings_dates is not None:
-            earnings_dates = t.earnings_dates.index
+            for d in t.earnings_dates.index:
+                earnings_dates_list.append(pd.Timestamp(d).normalize())
         elif hasattr(t, "calendar") and t.calendar is not None:
             cd = t.calendar
             if isinstance(cd, dict) and "Earnings Date" in cd:
-                earnings_dates = pd.to_datetime(cd["Earnings Date"])
-            elif isinstance(cd, pd.DataFrame) and "Earnings Date" in cd.index:
-                earnings_dates = pd.to_datetime(cd.loc["Earnings Date"])
-
-        if earnings_dates is not None and len(earnings_dates) > 0:
-            earnings_dates = pd.DatetimeIndex(earnings_dates).normalize()
-            for idx, d in enumerate(dates):
-                d_norm = pd.Timestamp(d).normalize()
-                future = earnings_dates[earnings_dates >= d_norm]
-                if len(future) > 0:
-                    days = (future[0] - d_norm).days
-                    cal.iloc[idx, cal.columns.get_loc("days_to_earnings")] = days
-                    if days == 0:
-                        cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
-                past = earnings_dates[earnings_dates == d_norm - timedelta(days=1)]
-                if len(past) > 0:
-                    cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
+                for d in pd.to_datetime(cd["Earnings Date"]):
+                    earnings_dates_list.append(pd.Timestamp(d).normalize())
     except Exception:
         pass
+
+    if not earnings_dates_list:
+        return cal
+
+    earnings_dates = pd.DatetimeIndex(sorted(set(earnings_dates_list)))
+
+    # Vectorized: for each date, find days to next earnings
+    for idx, d in enumerate(dates):
+        d_norm = pd.Timestamp(d).normalize()
+        future = earnings_dates[earnings_dates >= d_norm]
+        if len(future) > 0:
+            days = (future[0] - d_norm).days
+            cal.iloc[idx, cal.columns.get_loc("days_to_earnings")] = min(days, 90)
+            if days == 0:
+                cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
+        # Day after earnings = earnings impact day
+        yesterday_was_earnings = earnings_dates[earnings_dates == d_norm - timedelta(days=1)]
+        if len(yesterday_was_earnings) > 0:
+            cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
 
     return cal
 
@@ -401,14 +469,15 @@ def compute_earnings_features(ticker: str, dates: pd.DatetimeIndex, ohlcv: pd.Da
 def build_training_dataset(
     tickers: list[str], news_client, sentiment_scorer,
     lookback_years: int = TRAINING_LOOKBACK_YEARS,
+    end_date_str: str = None,
 ) -> tuple[pd.DataFrame, pd.Series]:
-    """Build feature matrix + target with adaptive threshold and pre-market data."""
+    """Build feature matrix + target with adaptive threshold."""
     from news import filter_articles_for_date, compute_sentiment_from_scores
-    from premarket import PremarketProvider
 
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=lookback_years * 365)).strftime("%Y-%m-%d")
-    buffer_start = (datetime.now() - timedelta(days=lookback_years * 365 + 60)).strftime("%Y-%m-%d")
+    ref_date = datetime.strptime(end_date_str, "%Y-%m-%d") if end_date_str else datetime.now()
+    end_date = ref_date.strftime("%Y-%m-%d")
+    start_date = (ref_date - timedelta(days=lookback_years * 365)).strftime("%Y-%m-%d")
+    buffer_start = (ref_date - timedelta(days=lookback_years * 365 + 60)).strftime("%Y-%m-%d")
 
     print(f"\n{'='*60}")
     print(f"  BUILDING TRAINING DATASET (v2 — adaptive threshold)")
@@ -471,30 +540,21 @@ def build_training_dataset(
         nc_mean = nc.rolling(60, min_periods=10).mean().shift(1)
         nc_std = nc.rolling(60, min_periods=10).std().shift(1)
         sent_df["news_count_z_score"] = ((nc - nc_mean) / nc_std.replace(0, np.nan)).fillna(0)
-
-        # Historical pre-market data (yfinance hourly)
-        pm_data = PremarketProvider.get_historical_premarket(ticker, buffer_start, end_date)
-        pm_features = pd.DataFrame(index=ohlcv.index)
-        if not pm_data.empty:
-            pm_data = pm_data.reindex(ohlcv.index, method=None)
-            prev_close = ohlcv["Close"].shift(1)
-            pm_features["premarket_change"] = (pm_data["premarket_price"] - prev_close) / prev_close
-            avg_vol = ohlcv["Volume"].rolling(10).mean()
-            pm_features["premarket_volume_ratio"] = pm_data["premarket_volume"] / avg_vol.replace(0, np.nan)
-        else:
-            pm_features["premarket_change"] = ohlcv["Open"].shift(0).sub(ohlcv["Close"].shift(1)).div(ohlcv["Close"].shift(1))
-            pm_features["premarket_volume_ratio"] = np.nan
+        # Binary flag: did this ticker get 3x its normal overnight news volume?
+        sent_df["news_spike"] = (nc >= (nc_mean * 3).clip(lower=3)).astype(int)
 
         # Earnings features
         earnings_feats = compute_earnings_features(ticker, ohlcv.index, ohlcv)
 
         # Combine all features
         ticker_features = sent_df.copy()
-        ticker_features = ticker_features.join(pm_features, how="left")
         ticker_features = ticker_features.join(tech, how="left")
         macro_cols = ["vix", "vix_change", "treasury_10y", "sp500_prev_return",
                       "yield_curve_spread", "dxy_change", "crude_oil_change",
-                      "gold_change", "sp500_5d_return"]
+                      "gold_change", "sp500_5d_return",
+                      "vix_change_3d", "vix_change_5d", "vix_regime",
+                      "dxy_change_5d", "crude_oil_change_5d", "gold_change_5d",
+                      "treasury_10y_delta_5d", "sp500_return_3d"]
         macro_available = [c for c in macro_cols if c in macro.columns]
         ticker_features = ticker_features.join(macro[macro_available], how="left")
         ticker_features["sector_momentum_5d"] = sector_mom.reindex(ticker_features.index, method="ffill")
@@ -533,32 +593,39 @@ def build_training_dataset(
     # Macro features are NOT filled here — a 0% change is a real signal,
     # not "missing". They stay NaN and get dropped by valid_mask if absent.
     optional_fill_cols = [
-        "premarket_change", "premarket_volume_ratio",
         "eps_surprise_last", "revenue_surprise_last", "earnings_streak",
         "post_earnings_drift_1d", "earnings_volatility",
+        # Lagged macro — NaN means not enough history for the rolling window,
+        # 0 is a safe fill (no momentum signal)
+        "vix_change_3d", "vix_change_5d", "vix_regime",
+        "dxy_change_5d", "crude_oil_change_5d", "gold_change_5d",
+        "treasury_10y_delta_5d", "sp500_return_3d",
     ]
     for col in optional_fill_cols:
         if col in X.columns:
             X[col] = X[col].fillna(0)
 
+    tickers = combined["_ticker"]
+
     valid_mask = X.notna().all(axis=1) & y.notna()
     X = X[valid_mask]
     y = y[valid_mask].astype(int)
     intraday_ret = intraday_ret[valid_mask]
+    tickers = tickers[valid_mask]
 
     print(f"\n  Dataset built: {len(X)} rows × {len(FEATURE_COLUMNS)} features")
     for label_idx, name in enumerate(["spike_down", "flat", "spike_up"]):
         count = (y == label_idx).sum()
         print(f"    {name}: {count} ({count/len(y)*100:.1f}%)")
 
-    return X, y, intraday_ret
+    return X, y, intraday_ret, tickers
 
 
 # ── Single-Day Feature Builder (for live prediction) ────────────────────────
 
 def build_single_day_features(
     ticker: str, date: datetime, news_client, sentiment_scorer,
-    ohlcv_cache=None, macro_cache=None, premarket_data=None,
+    ohlcv_cache=None, macro_cache=None,
 ) -> pd.Series:
     """Build one feature row for a ticker on a given date (live prediction)."""
     from news import compute_sentiment_features
@@ -591,21 +658,30 @@ def build_single_day_features(
     last_idx = ohlcv.index[-1]
     row = {}
     row.update(sent)
-    # For live prediction, news_count_z_score defaults to 0 (no rolling baseline available)
-    row["news_count_z_score"] = 0
-
-    # Pre-market features
-    if premarket_data and ticker in premarket_data:
-        pm = premarket_data[ticker]
-        pc = pm.get("prev_close", np.nan)
-        pp = pm.get("premarket_price", np.nan)
-        pv = pm.get("premarket_volume", np.nan)
-        row["premarket_change"] = (pp - pc) / pc if pc and pc > 0 and not np.isnan(pp) else 0
-        avg_vol = tech.loc[last_idx, "avg_volume_10d"] if last_idx in tech.index else 1
-        row["premarket_volume_ratio"] = pv / avg_vol if avg_vol and avg_vol > 0 and not np.isnan(pv) else 0
-    else:
-        row["premarket_change"] = tech.loc[last_idx, "overnight_gap"] if last_idx in tech.index else 0
-        row["premarket_volume_ratio"] = 0
+    # Compute news_count_z_score and news_spike from cached news history.
+    today_count = sent.get("overnight_news_count", 0)
+    try:
+        from news import filter_articles_for_date
+        cached_articles = news_client.fetch_news(
+            ticker,
+            (date - timedelta(days=65)).strftime("%Y-%m-%d"),
+            date.strftime("%Y-%m-%d"),
+        )
+        daily_counts = []
+        for d in ohlcv.index[-60:]:
+            day_articles = filter_articles_for_date(cached_articles, d)
+            daily_counts.append(len(day_articles))
+        if len(daily_counts) >= 10:
+            nc_mean = np.mean(daily_counts)
+            nc_std = np.std(daily_counts)
+            row["news_count_z_score"] = (today_count - nc_mean) / nc_std if nc_std > 0 else 0
+            row["news_spike"] = 1 if today_count >= max(nc_mean * 3, 3) else 0
+        else:
+            row["news_count_z_score"] = 0
+            row["news_spike"] = 0
+    except Exception:
+        row["news_count_z_score"] = 0
+        row["news_spike"] = 0
 
     if last_idx in tech.index:
         for col in tech.columns:
@@ -614,7 +690,10 @@ def build_single_day_features(
     if isinstance(macro_row, dict):
         for k in ["vix", "vix_change", "treasury_10y", "sp500_prev_return",
                   "yield_curve_spread", "dxy_change", "crude_oil_change",
-                  "gold_change", "sp500_5d_return"]:
+                  "gold_change", "sp500_5d_return",
+                  "vix_change_3d", "vix_change_5d", "vix_regime",
+                  "dxy_change_5d", "crude_oil_change_5d", "gold_change_5d",
+                  "treasury_10y_delta_5d", "sp500_return_3d"]:
             row[k] = macro_row.get(k, np.nan)
 
     if last_idx in sector_mom.index:
