@@ -1,0 +1,91 @@
+name: Daily Trading (Delayed — 10:00 AM ET, Account B)
+
+# Second leg of the A/B timing experiment: trades the SAME morning watchlist
+# but ~30 minutes after the open, into a separate Alpaca paper account.
+# Lets us compare 9:30-open fills vs 10:00 fills with no day-bias.
+#
+# Triggered by Cloudflare Worker cron at 10:00 AM ET, or manual dispatch.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  trade-delayed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Set ET date
+        id: et_date
+        run: echo "today=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
+      - name: Cache Telegram subscribers
+        uses: actions/cache@v4
+        with:
+          path: data/subscribers.json
+          key: telegram-subscribers-${{ github.run_id }}
+          restore-keys: telegram-subscribers-
+
+      - name: Restore trade log (delayed account)
+        uses: actions/cache@v4
+        with:
+          path: output/trade_log_delayed.csv
+          key: trade-log-delayed-${{ github.run_id }}
+          restore-keys: trade-log-delayed-
+
+      - name: Download morning watchlist
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          name: watchlist-${{ steps.et_date.outputs.today }}
+          path: output/
+          workflow: daily_trade.yml
+          workflow_conclusion: success
+          search_artifacts: true
+          if_no_artifact_found: fail
+
+      - name: Place paper trades (Account DELAYED — 10:00 fill)
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY_DELAYED }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY_DELAYED }}
+        run: |
+          python predict/trade.py --paper --label delayed \
+            --watchlist "output/watchlist_${{ steps.et_date.outputs.today }}.csv"
+
+      - name: Send trade confirmations to Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python predict/notify.py --trades --label delayed
+
+      - name: Save artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: delayed-trade-${{ steps.et_date.outputs.today }}
+          path: output/trade_log_delayed.csv
+          retention-days: 90
+          if-no-files-found: warn
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d parse_mode=Markdown \
+            -d text="*Spike Trader [DELAYED]* — daily_trade_delayed.yml failed for ${{ steps.et_date.outputs.today }}. Check run ${{ github.run_id }}."

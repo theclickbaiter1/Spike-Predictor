@@ -59,9 +59,16 @@ class AlpacaClient:
         }
         self.paper = paper
 
-    def _request(self, method, endpoint, json_data=None):
+    # Trading endpoints live on paper-api.alpaca.markets (paper) /
+    # api.alpaca.markets (live). Market data endpoints live on a separate
+    # host: data.alpaca.markets. Sending data queries to the trading host
+    # returns 404 — which is what was silently breaking get_latest_price
+    # and stopping every order from being placed.
+    DATA_URL = "https://data.alpaca.markets"
+
+    def _request(self, method, endpoint, json_data=None, base_url=None):
         import requests
-        url = f"{self.base_url}{endpoint}"
+        url = f"{base_url or self.base_url}{endpoint}"
         resp = requests.request(method, url, headers=self.headers, json=json_data, timeout=15)
         if not resp.ok:
             print(f"  ❌ Alpaca API error: {resp.status_code} {resp.text}")
@@ -95,8 +102,12 @@ class AlpacaClient:
         return self._request("POST", "/v2/orders", json_data=order)
 
     def get_latest_price(self, ticker):
-        """Get the latest trade price for a ticker."""
-        data = self._request("GET", f"/v2/stocks/{ticker}/trades/latest")
+        """Get the latest trade price for a ticker (market-data API host)."""
+        data = self._request(
+            "GET",
+            f"/v2/stocks/{ticker}/trades/latest?feed=iex",
+            base_url=self.DATA_URL,
+        )
         if data and "trade" in data:
             return float(data["trade"]["p"])
         return None
@@ -107,12 +118,20 @@ class AlpacaClient:
 
 # ── Trade History (for consecutive-day tracking) ─────────────────────────────
 
-def load_recent_trades(days=5):
+def trade_log_path(label: str) -> Path:
+    """Return the trade log path for a given account label."""
+    if label == "open":
+        return TRADE_LOG_PATH
+    return OUTPUT_DIR / f"trade_log_{label}.csv"
+
+
+def load_recent_trades(days=5, label: str = "open"):
     """Load trade log and return tickers traded in recent days."""
-    if not TRADE_LOG_PATH.exists():
+    path = trade_log_path(label)
+    if not path.exists():
         return {}
 
-    df = pd.read_csv(TRADE_LOG_PATH)
+    df = pd.read_csv(path)
     if df.empty or "date" not in df.columns:
         return {}
 
@@ -141,13 +160,15 @@ def load_recent_trades(days=5):
     return ticker_streaks
 
 
-def log_trades(trades):
-    """Append trades to the trade log CSV."""
+def log_trades(trades, label: str = "open"):
+    """Append trades to the trade log CSV for this account label."""
     if not trades:
         return
 
-    file_exists = TRADE_LOG_PATH.exists()
-    with open(TRADE_LOG_PATH, "a", newline="") as f:
+    path = trade_log_path(label)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = path.exists()
+    with open(path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "date", "time", "ticker", "direction", "qty", "entry_price",
             "take_profit", "stop_loss", "p_spike", "p_dir", "order_id", "mode",
@@ -227,12 +248,39 @@ def generate_signals():
     return signals
 
 
+def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
+    """
+    Load signals from a watchlist CSV produced by the morning prediction run.
+
+    Used by the delayed-execution workflow so we trade off the 9:15 prediction
+    snapshot (clean, pre-market data) rather than regenerating predictions at
+    10:00 AM with intraday news leakage in the features.
+    """
+    if not csv_path.exists():
+        print(f"  ❌ Watchlist not found at {csv_path}.")
+        sys.exit(1)
+
+    df = pd.read_csv(csv_path)
+    signals = []
+    for _, r in df.iterrows():
+        if float(r["p_spike"]) >= TRADE_THRESHOLD:
+            direction = "LONG" if r["p_up"] > r["p_down"] else "SHORT"
+            signals.append({
+                "ticker": r["ticker"],
+                "direction": direction,
+                "p_spike": float(r["p_spike"]),
+                "p_dir": float(max(r["p_up"], r["p_down"])),
+            })
+    signals.sort(key=lambda s: s["p_spike"], reverse=True)
+    return signals
+
+
 # ── Risk Filters ─────────────────────────────────────────────────────────────
 
-def apply_risk_filters(signals):
+def apply_risk_filters(signals, label: str = "open"):
     """Apply risk management rules to filter and limit signals."""
     # 1. Remove tickers traded too many consecutive days
-    streaks = load_recent_trades()
+    streaks = load_recent_trades(label=label)
     filtered = []
     for sig in signals:
         streak = streaks.get(sig["ticker"], 0)
@@ -356,11 +404,11 @@ def execute_trades(signals, client, dry_run=False):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def print_banner(mode):
+def print_banner(mode, label):
     now = datetime.now(ET)
     print()
     print("═" * 65)
-    print(f"  SPIKE TRADER — {now.strftime('%Y-%m-%d %I:%M %p ET')}")
+    print(f"  SPIKE TRADER [{label.upper()}] — {now.strftime('%Y-%m-%d %I:%M %p ET')}")
     print(f"  Mode: {mode.upper()}")
     print("═" * 65)
 
@@ -374,6 +422,11 @@ def main():
                        help="Live trading — real money!")
     group.add_argument("--dry-run", action="store_true",
                        help="Show signals and simulated orders, no actual trades")
+    parser.add_argument("--label", type=str, default="open",
+                        help="Account label (e.g. 'open', 'delayed'). Determines trade log filename.")
+    parser.add_argument("--watchlist", type=str, default=None,
+                        help="Path to a watchlist CSV. If provided, skips signal "
+                             "regeneration and trades off this snapshot.")
     args = parser.parse_args()
 
     if args.live:
@@ -383,7 +436,8 @@ def main():
     else:
         mode = "paper"
 
-    print_banner(mode)
+    label = args.label
+    print_banner(mode, label)
 
     # Safety check for live trading
     if mode == "live":
@@ -394,13 +448,18 @@ def main():
 
     # Validate API keys (except for dry run)
     if mode != "dry-run" and (not ALPACA_API_KEY or not ALPACA_SECRET_KEY):
-        print("\n  ❌ ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env")
+        print("\n  ❌ ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env or workflow env.")
         print("     Sign up at https://alpaca.markets for free paper trading.")
         sys.exit(1)
 
-    # Step 1: Generate signals
-    print("\n  Step 1: Generating spike predictions...\n")
-    signals = generate_signals()
+    # Step 1: Get signals (regenerate or load from watchlist)
+    if args.watchlist:
+        watchlist_path = Path(args.watchlist)
+        print(f"\n  Step 1: Loading signals from {watchlist_path}...")
+        signals = load_signals_from_watchlist(watchlist_path)
+    else:
+        print("\n  Step 1: Generating spike predictions...\n")
+        signals = generate_signals()
 
     if not signals:
         print("\n  📭 No tickers above threshold today. No trades.")
@@ -413,7 +472,7 @@ def main():
 
     # Step 2: Apply risk filters
     print(f"\n  Step 2: Applying risk filters...")
-    filtered = apply_risk_filters(signals)
+    filtered = apply_risk_filters(signals, label=label)
 
     if not filtered:
         print("\n  All signals filtered out by risk rules. No trades today.")
@@ -431,8 +490,8 @@ def main():
 
     # Step 4: Log trades
     if trade_records:
-        log_trades(trade_records)
-        print(f"\n  📄 {len(trade_records)} trades logged to {TRADE_LOG_PATH}")
+        log_trades(trade_records, label=label)
+        print(f"\n  📄 {len(trade_records)} trades logged to {trade_log_path(label)}")
 
     # Step 5: Summary
     print(f"\n  {'=' * 60}")

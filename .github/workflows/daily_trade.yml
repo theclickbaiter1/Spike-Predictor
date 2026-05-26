@@ -63,18 +63,18 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python predict/notify.py
 
-      - name: Place paper trades
+      - name: Place paper trades (Account OPEN — 9:30 fill)
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python predict/trade.py --paper
+        run: python predict/trade.py --paper --label open
 
       - name: Send trade confirmations to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python predict/notify.py --trades
+        run: python predict/notify.py --trades --label open
 
       - name: Set ET date
         id: et_date

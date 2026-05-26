@@ -203,26 +203,33 @@ def format_watchlist(csv_path: str) -> str:
     return "\n".join(lines)
 
 
-def format_trade_summary(csv_path: str = None) -> str:
-    """Format today's trades from trade_log.csv for Telegram."""
+def format_trade_summary(csv_path: str = None, label: str = "open") -> str:
+    """Format today's trades from the per-account trade log for Telegram."""
     import pandas as pd
 
-    path = Path(csv_path) if csv_path else TRADE_LOG_PATH
+    if csv_path:
+        path = Path(csv_path)
+    elif label == "open":
+        path = TRADE_LOG_PATH
+    else:
+        path = OUTPUT_DIR / f"trade_log_{label}.csv"
+
+    tag = label.upper()
     if not path.exists():
-        return "*Spike Trader* — No trade log found."
+        return f"*Spike Trader [{tag}]* — No trade log found."
 
     df = pd.read_csv(path)
     if df.empty:
-        return "*Spike Trader* — No trades recorded."
+        return f"*Spike Trader [{tag}]* — No trades recorded."
 
     # Filter to today's trades
     today = datetime.now().strftime("%Y-%m-%d")
     df_today = df[df["date"] == today]
 
     if df_today.empty:
-        return f"*Spike Trader — {today}*\n\n📭 No trades placed today."
+        return f"*Spike Trader [{tag}] — {today}*\n\n📭 No trades placed today."
 
-    lines = [f"*Spike Trader — {today}*\n"]
+    lines = [f"*Spike Trader [{tag}] — {today}*\n"]
     lines.append(f"📊 *{len(df_today)} orders placed*\n")
 
     for _, t in df_today.iterrows():
@@ -292,6 +299,8 @@ def main():
                         help="Send daily validation summary instead of watchlist")
     parser.add_argument("--poll-only", action="store_true",
                         help="Poll for /start and /stop commands; do not send any broadcast")
+    parser.add_argument("--label", type=str, default="open",
+                        help="Account label for --trades summary (e.g. 'open', 'delayed').")
     args = parser.parse_args()
 
     if args.poll_only:
@@ -305,7 +314,7 @@ def main():
         return
 
     if args.trades:
-        msg = format_trade_summary()
+        msg = format_trade_summary(label=args.label)
         send_telegram(msg)
         return
 
