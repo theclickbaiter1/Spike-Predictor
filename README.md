@@ -1,117 +1,150 @@
 # Pre-Market Spike Detector v2
 
-A Python pipeline that predicts which stocks will experience significant intraday price spikes before market open. Uses a two-stage XGBoost model with FinBERT sentiment analysis, adaptive per-ticker thresholds, and 45 features spanning sentiment, technical, macro, earnings, and calendar signals.
+A fully automated Python pipeline that predicts intraday stock spikes before market open and executes paper trades through Alpaca. Built around a two-stage XGBoost model with FinBERT sentiment, adaptive per-ticker thresholds, and 45 features spanning sentiment, technical, macro, earnings, and calendar signals. The full daily loop — predict, alert, trade, validate, retrain — runs on its own with no human in the loop.
 
-**Last updated:** May 22, 2026
+**Last updated:** May 26, 2026 (added A/B timing experiment via dual paper accounts; fixed Alpaca data-API URL bug; added Telegram /start subscriber broadcast)
 
-## How It Works
+## What problem this solves
 
-Every trading day at **9:15 AM ET** (15 minutes before the open), the pipeline:
+The model is **not a price predictor**. It's a binary spike classifier — given the state of the world at 9:15 AM ET on any given trading day, will this stock produce a significant intraday move (up or down) relative to its own recent volatility? "Significant" is defined adaptively per ticker (NVDA's threshold is higher than AAPL's because NVDA is intrinsically more volatile). The model uses **only data available before 9:30 AM ET** — no peeking at intraday news or prices.
 
-1. Fetches overnight news headlines from Finnhub and scores them with FinBERT
-2. Pulls OHLCV history and macro indicators (VIX, treasuries, FX, commodities)
-3. Computes 45 features from trailing OHLCV, macro data, calendar, and earnings history
-4. Runs a two-stage XGBoost model:
-   - **Stage 1** predicts whether a spike will occur (binary)
-   - **Stage 2** predicts the direction — up or down (binary)
-5. Outputs a ranked watchlist, sends it to Telegram, and places bracket orders via Alpaca for tickers above the trade threshold
+The end goal: identify the 2–3 tickers each morning most likely to make a 3%+ intraday move, predict the direction, and trade them with risk-limited bracket orders.
 
-**Important:** This is not a price predictor. It classifies whether today's session will produce a large intraday move relative to the stock's own volatility, using only data available before 9:30 AM ET.
+## Daily flow at a glance
 
-## System Architecture
+| Time (ET) | What happens | Telegram you'll receive |
+|---|---|---|
+| **9:15 AM** | Predict → save watchlist artifact → place trades on **Account OPEN** | Watchlist + `[OPEN]` trade confirmations |
+| **10:00 AM** | Load morning watchlist → place same signals on **Account DELAYED** | `[DELAYED]` trade confirmations |
+| **4:30 PM** | Pull actual intraday returns → compute metrics → update trend chart | Daily validation summary + 10d rolling avg |
+| **Sunday 7:00 AM** | Retrain model on the past 2 years of data | (silent) |
+
+Everything is triggered by a single Cloudflare Worker cron, which dispatches GitHub Actions workflows. Each workflow runs on a fresh Ubuntu runner, downloads the trained model artifact, executes its task, and uploads its outputs as artifacts.
+
+## System architecture
 
 ```mermaid
 flowchart TB
-    subgraph Schedule["Scheduling (DST-aware)"]
-        CF[Cloudflare Worker Cron<br/>9:15 AM ET trade<br/>4:30 PM ET validate<br/>7:00 AM Sun retrain]
+    subgraph CFW["Cloudflare Worker (DST-aware, holiday-aware)"]
+        C1[9:15 AM ET cron → daily_trade.yml]
+        C2[10:00 AM ET cron → daily_trade_delayed.yml]
+        C3[4:30 PM ET cron → daily_validate.yml]
+        C4[Sunday 7:00 AM ET cron → retrain.yml]
     end
 
-    subgraph Ingest["Data Sources"]
+    subgraph Sources["External Data Sources"]
         FH[Finnhub<br/>company news]
         YF[yfinance<br/>OHLCV + macro + earnings]
-        AL[Alpaca<br/>account + order routing]
+        ALP_DATA[Alpaca Market Data<br/>data.alpaca.markets<br/>latest trade prices]
+        ALP_OPEN[Alpaca Paper Account OPEN<br/>paper-api.alpaca.markets]
+        ALP_DEL[Alpaca Paper Account DELAYED<br/>paper-api.alpaca.markets]
     end
 
-    subgraph Features["Feature Engineering — 45 features"]
-        SEN[Sentiment x7<br/>FinBERT mean/max/min/std,<br/>news count z-score, news spike]
-        TECH[Technical x10<br/>RSI, EMA, vol,<br/>gaps, momentum]
-        MACRO[Macro x18<br/>VIX, treasuries, SP500,<br/>DXY, oil, gold + 5d lags]
-        CAL[Calendar x5<br/>day-of-week,<br/>earnings flags]
-        EARN[Earnings x5<br/>EPS/rev surprise,<br/>streak, drift, vol]
+    subgraph Pipeline["GitHub Actions"]
+        GTR[daily_trade.yml<br/>predict + Telegram + trade OPEN]
+        GDEL[daily_trade_delayed.yml<br/>load watchlist + trade DELAYED]
+        GVAL[daily_validate.yml<br/>actuals + rolling metrics]
+        GRET[retrain.yml<br/>weekly model rebuild]
     end
 
-    subgraph Model["Two-Stage XGBoost"]
-        S1[Stage 1: P_spike<br/>binary classifier<br/>scale_pos_weight for imbalance]
-        S2[Stage 2: P_up_given_spike<br/>direction classifier<br/>trained on near-spike samples]
+    subgraph Model["Two-Stage XGBoost — 45 features"]
+        FEAT[Feature Engineering<br/>sentiment ×7, technical ×10<br/>macro ×18, calendar ×5, earnings ×5]
+        S1[Stage 1: P_spike<br/>binary, scale_pos_weight]
+        S2[Stage 2: P_up given spike<br/>regularized, near-spike training]
     end
 
-    subgraph Output["Output Channels"]
-        WL[Ranked Watchlist<br/>output/watchlist_YYYY-MM-DD.csv]
-        TG[Telegram Alerts<br/>watchlist + trades + validation]
-        ORD[Alpaca Bracket Orders<br/>market entry, TP +5%, SL -3%]
+    subgraph State["Persistent State (GHA Cache + Artifacts)"]
+        ART_MODEL[(spike-model<br/>weekly retrain artifact)]
+        ART_WL[(watchlist-YYYY-MM-DD<br/>9:15 AM watchlist)]
+        ART_VAL[(validation-state<br/>history, metrics, trend chart)]
+        ART_SUBS[(subscribers.json<br/>Telegram /start chat_ids)]
+        ART_LOG_O[(trade_log_open.csv)]
+        ART_LOG_D[(trade_log_delayed.csv)]
     end
 
-    subgraph Feedback["Feedback Loop"]
-        VAL[Daily Validation 4:30 PM ET<br/>pred vs actual + rolling metrics<br/>+ trend chart]
-        HIST[(validation_state/<br/>history.csv, metrics.csv,<br/>trend.png — cached across runs)]
+    subgraph TG["Telegram Broadcast"]
+        TG_OUT[Owner + all /start subscribers]
     end
 
-    CF -->|9:15 AM trade dispatch| GTRADE[GHA daily_trade.yml]
-    CF -->|4:30 PM validate dispatch| GVAL[GHA daily_validate.yml]
-    GTRADE --> FH
-    GTRADE --> YF
-    FH --> SEN
-    YF --> TECH
-    YF --> MACRO
-    YF --> CAL
-    YF --> EARN
-    SEN --> S1
-    TECH --> S1
-    MACRO --> S1
-    CAL --> S1
-    EARN --> S1
-    S1 --> S2
-    S2 --> WL
-    WL --> TG
-    WL -->|P_spike >= 0.40| ORD
-    AL --> ORD
-    WL -.->|stable-named artifact| GVAL
-    GVAL --> VAL
-    VAL --> HIST
-    VAL --> TG
+    C1 --> GTR
+    C2 --> GDEL
+    C3 --> GVAL
+    C4 --> GRET
+
+    GRET --> ART_MODEL
+    ART_MODEL --> GTR
+    ART_MODEL -.->|fallback path<br/>not needed daily| GDEL
+
+    GTR --> FH
+    GTR --> YF
+    FH --> FEAT
+    YF --> FEAT
+    FEAT --> S1 --> S2
+    S2 --> ART_WL
+    S2 --> TG_OUT
+
+    ART_WL --> GDEL
+    ART_WL --> GVAL
+
+    GTR --> ALP_DATA
+    GTR --> ALP_OPEN
+    GDEL --> ALP_DATA
+    GDEL --> ALP_DEL
+
+    GTR --> ART_LOG_O
+    GDEL --> ART_LOG_D
+    GTR --> TG_OUT
+    GDEL --> TG_OUT
+
+    GVAL --> YF
+    GVAL --> ART_VAL
+    GVAL --> TG_OUT
+
+    TG_OUT --> ART_SUBS
+    ART_SUBS --> TG_OUT
 ```
 
-## Repo Layout
+## Repo layout
 
 ```
 .
-├── config.py              # Universe, feature columns, XGBoost params, risk limits
-├── features.py            # Feature engineering (technical, macro, sentiment, earnings, calendar)
-├── model.py               # Two-stage XGBoost model + time-series split
-├── news.py                # Finnhub client + FinBERT scorer (disk-cached)
+├── config.py                  # Universe, feature columns, XGBoost params, risk limits, API URLs
+├── features.py                # Feature engineering (technical, macro, sentiment, earnings, calendar)
+├── model.py                   # Two-stage XGBoost model + time-series split + retrain
+├── news.py                    # Finnhub client + FinBERT scorer (disk-cached)
 ├── predict/
-│   ├── spike_detector.py  # Main pipeline — predict + --retrain modes
-│   ├── trade.py           # Alpaca bracket order execution
-│   ├── notify.py          # Telegram alerts (watchlist + trade confirmations)
-│   └── run_daily.sh       # Wrapper used by GitHub Actions
+│   ├── spike_detector.py      # Main pipeline — predict + --retrain modes
+│   ├── trade.py               # Alpaca bracket order execution
+│   │                          #   --label {open|delayed} → per-account trade log
+│   │                          #   --watchlist <csv>     → skip regeneration, use saved snapshot
+│   ├── notify.py              # Telegram alerts + /start subscriber polling
+│   │                          #   --trades --label open|delayed
+│   │                          #   --validate
+│   │                          #   --poll-only
+│   └── run_daily.sh           # Wrapper used by GitHub Actions
 ├── backtest/
 │   ├── backtest.py            # Historical model performance
 │   ├── backtest_strategy.py   # Strategy backtest with TP/SL
 │   ├── daily_validation.py    # Lightweight daily pred-vs-actual + rolling metrics
-│   ├── validate_today.py      # Full retrain-and-validate for a single date
-│   └── validate_week.py       # Full retrain-and-validate for a date range
-├── data/                  # Cached news, earnings, OHLCV, trained model
-├── output/                # Daily watchlists, trade logs, validation reports
+│   ├── validate_today.py      # Full retrain-and-validate for a single date (heavy)
+│   └── validate_week.py       # Full retrain-and-validate for a date range (heavy)
+├── data/                      # gitignored — cached news, earnings, OHLCV, model, subscribers.json
+├── output/                    # gitignored — daily watchlists, per-account trade logs, validation_state/
+├── pyrefly.toml               # Points Pyrefly at venv/bin/python (IDE diagnostics)
+├── .vscode/settings.json      # Same for Pylance + Python extension
 └── .github/workflows/
-    ├── daily_predict.yml   # Prediction-only run (no trades)
-    ├── daily_trade.yml     # Prediction + Alpaca paper trades (9:15 AM ET)
-    ├── daily_validate.yml  # Post-market pred-vs-actual (4:30 PM ET)
-    └── retrain.yml         # Weekly model retrain (Sun 7 AM ET)
+    ├── daily_predict.yml          # Prediction-only manual run (workflow_dispatch only)
+    ├── daily_trade.yml            # 9:15 AM ET — predict + trade OPEN account
+    ├── daily_trade_delayed.yml    # 10:00 AM ET — trade morning watchlist on DELAYED account
+    ├── daily_validate.yml         # 4:30 PM ET — pred-vs-actual rolling metrics
+    └── retrain.yml                # Sunday 7 AM ET — weekly retrain
 ```
 
-## Quick Start
+The Cloudflare Worker source lives outside this repo at `~/spike-scheduler/` (separate concern, separate deploy). It's just `worker.js` + `wrangler.toml` — see [Cloudflare Worker](#cloudflare-worker) below.
 
-### 1. Set Up Environment
+## Quick start
+
+### 1. Set up environment
 
 ```bash
 python3 -m venv venv
@@ -119,53 +152,73 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Set API Keys
+### 2. Set API keys in `.env`
 
-Create a `.env` file (see existing `.env` for the keys used):
-
-```
+```bash
+# Finnhub (overnight company news)
 FINNHUB_API_KEY=...
-ALPACA_API_KEY=...
+
+# Alpaca — Account OPEN (trades at 9:30 open)
+ALPACA_API_KEY=PK...
 ALPACA_SECRET_KEY=...
+
+# Alpaca — Account DELAYED (trades at 10:00 — A/B experiment)
+ALPACA_API_KEY_DELAYED=PK...
+ALPACA_SECRET_KEY_DELAYED=...
+
+# Telegram bot — owner is always notified; /start subscribers also added at runtime
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...
 ```
 
-### 3. Train the Model
+For automation, these same names exist as **GitHub Actions secrets** at `https://github.com/<owner>/<repo>/settings/secrets/actions`. Locally they live in `.env` (which is gitignored).
+
+### 3. Train the model (first time)
 
 ```bash
 python predict/spike_detector.py --retrain
 ```
 
-Downloads 2 years of OHLCV data for 60 tickers, fetches overnight news from Finnhub, scores headlines with FinBERT, and trains the two-stage XGBoost model with time-series validation. Cached responses live under `data/` so subsequent retrains are fast.
+Downloads 2 years of OHLCV data for ~60 tickers, fetches overnight news from Finnhub, scores headlines with FinBERT, and trains the two-stage XGBoost model with time-series validation. ~15-20 min on first run, faster after caching (`data/news_cache/`, `data/earnings_cache/`).
 
-### 4. Run Daily Predictions
-
-```bash
-python predict/spike_detector.py        # Generate watchlist only
-python predict/trade.py --dry-run       # Show signals + simulated orders
-python predict/trade.py --paper         # Paper trading via Alpaca (default)
-python predict/trade.py --live          # Live trading — requires explicit flag
-```
-
-### 5. Validate and Backtest
+### 4. Run predictions / trades locally
 
 ```bash
-python backtest/validate_today.py       # Compare today's predictions to actuals
-python backtest/validate_week.py        # Roll up the past week
-python backtest/backtest.py             # Last 6 months of model performance
-python backtest/backtest_strategy.py    # Full strategy backtest with TP/SL
+# Just predict (writes output/watchlist_YYYY-MM-DD.csv)
+python predict/spike_detector.py
+
+# Dry-run trade simulation (no actual orders)
+python predict/trade.py --dry-run
+
+# Paper trade (default — uses ALPACA_API_KEY)
+python predict/trade.py --paper --label open
+
+# Paper trade the delayed account from a saved watchlist
+python predict/trade.py --paper --label delayed \
+  --watchlist output/watchlist_2026-05-26.csv
+
+# Live trading (requires explicit flag + interactive 'yes' confirmation)
+python predict/trade.py --live
 ```
 
-## Two-Stage Model Architecture
+### 5. Validate today's predictions
 
-### Stage 1: Spike Detection (Binary)
+```bash
+python backtest/daily_validation.py            # validate today
+python backtest/daily_validation.py --date 2026-05-26   # backfill a past date
+```
 
-Predicts P(spike) — whether any significant move will occur. Trained with `scale_pos_weight` to handle the ~88% flat / 12% spike class imbalance. **Excludes `realized_vol_20d`** from its feature set to prevent the "always flag volatile stocks" bias — `vol_z_score` (relative volatility) captures regime shifts without the absolute-level shortcut.
+This is the lightweight one — reads `output/watchlist_<date>.csv`, fetches actuals via yfinance, appends to `output/validation_state/{history,metrics}.csv`, regenerates `trend.png`. The "heavy" alternative (`backtest/validate_today.py`) retrains the model from scratch first and is meant for ad-hoc deeper investigation, not daily use.
 
-### Stage 2: Direction Classification (Binary)
+## Two-stage model architecture
 
-Predicts P(up | spike) — if a spike happens, which way. Trained on **spike + near-spike samples** (days where the return exceeded 50% of the spike threshold) rather than all samples. This gives the model ~10,000 training rows of meaningful directional moves without diluting signal with flat days that would bias it bearish. Heavily regularized (`max_depth=3`, high `min_child_weight`, strong L1/L2) to combat the 92% val → 50% live overfitting seen in the v1 model.
+### Stage 1: Spike detection (binary)
+
+Predicts `P(spike)` — whether any significant intraday move will occur. Trained with `scale_pos_weight` to handle the ~88% flat / 12% spike class imbalance. **Excludes `realized_vol_20d`** from its feature set to prevent the "always flag volatile stocks" bias — `vol_z_score` (relative volatility) captures regime shifts without the absolute-level shortcut.
+
+### Stage 2: Direction classification (binary)
+
+Predicts `P(up | spike)` — if a spike happens, which way. Trained on **spike + near-spike samples** (days where the return exceeded 50% of the spike threshold) rather than all samples. This gives the model ~10,000 training rows of meaningful directional moves without diluting signal with flat days that would bias it bearish. Heavily regularized (`max_depth=3`, `min_child_weight=20`, `gamma=1.0`, `reg_alpha=1.0`, `reg_lambda=5.0`) to combat the 92% val → 50% live overfitting seen in v1.
 
 ### Inference
 
@@ -176,7 +229,7 @@ p_down  = p_spike * (1 - Stage2.predict_proba(X))
 p_flat  = 1 - p_spike
 ```
 
-### Adaptive Spike Threshold
+### Adaptive spike threshold
 
 Each ticker gets its own threshold based on its historical volatility:
 
@@ -184,30 +237,30 @@ Each ticker gets its own threshold based on its historical volatility:
 threshold = max(20-day avg |intraday return| * 1.5, 3%)
 ```
 
-NVDA's threshold might be 5%, while AAPL's might be 3%. This prevents volatile stocks from always being labeled as "spiking."
+NVDA's threshold might be 5%, while AAPL's might be 3%. This prevents volatile stocks from being labeled as "spiking" every day just because they always move.
 
 ## Features (45 total)
 
 ### Sentiment (7)
-Overnight news headlines scored with [ProsusAI/FinBERT](https://huggingface.co/ProsusAI/finbert). Mean, max, min, std of sentiment scores, raw news count, z-scored news volume (abnormal attention signal), and a binary news-spike flag (3x normal volume).
+Overnight news headlines scored with [ProsusAI/FinBERT](https://huggingface.co/ProsusAI/finbert). Mean, max, min, std of sentiment scores, raw news count, z-scored news volume (abnormal-attention signal), and a binary news-spike flag (≥3× normal overnight volume).
 
 ### Technical (10)
-Previous close, RSI-14, EMA-10, 20-day realized volatility, volatility z-score, 10-day average volume, previous day return/range, 3-day momentum, and overnight gap. All shifted to avoid lookahead.
+Previous close, RSI-14, EMA-10, 20-day realized volatility, volatility z-score, 10-day average volume, previous day return/range, 3-day momentum, overnight gap. All `.shift(1)` to avoid lookahead.
 
 ### Macro (18)
-VIX level + daily change, 10Y treasury yield, yield curve spread (10Y minus 3M), SP500 1-day and 5-day returns, sector ETF 5-day momentum, USD index change, crude oil change, gold change, **plus 8 lagged 3-day/5-day variants** so the model can see sustained regime shifts vs single-day blips.
+VIX level + daily change, 10Y treasury yield, yield curve spread (10Y minus 3M), SP500 1d/5d returns, sector ETF 5-day momentum, USD index change, crude oil change, gold change, **plus 8 lagged 3-day/5-day variants** so the model can see sustained regime shifts vs single-day blips.
 
 ### Calendar (5)
 Day of week, Monday/Friday flags, days to next earnings, earnings day flag.
 
 ### Earnings (5)
-Most recent EPS surprise %, revenue surprise %, consecutive beat/miss streak, post-earnings 1-day drift, and average absolute return on earnings days (last 4 quarters).
+Most recent EPS surprise %, revenue surprise %, consecutive beat/miss streak, post-earnings 1-day drift, average absolute return on earnings days (last 4 quarters).
 
 ### Planned (not yet implemented)
 - Live pre-market price/volume features (requires paid Alpaca data tier)
 - Options flow / unusual options activity (requires paid feed)
 
-## Ticker Universe (60 stocks)
+## Ticker universe (60 stocks)
 
 | Sector | Tickers |
 |--------|---------|
@@ -222,13 +275,13 @@ Most recent EPS surprise %, revenue surprise %, consecutive beat/miss streak, po
 | Meme / Speculative | GME, AMC |
 | Sector ETFs | SMH, QTUM, XLK, XLF, XLE, XBI, XLY, XLI |
 
-## Trading Strategy
+## Trading strategy
 
-Configured in `config.py`:
+Configured in [config.py](config.py):
 
 | Setting | Value | Purpose |
 |---|---|---|
-| `TRADE_THRESHOLD` | 0.40 | Minimum P(spike) to enter a position |
+| `TRADE_THRESHOLD` | 0.40 | Minimum `P(spike)` to enter a position |
 | `MAX_POSITIONS_PER_DAY` | 3 | Cap on simultaneous positions |
 | `MAX_POSITION_PCT` | 10% | Per-position cap as % of equity |
 | `MAX_DAILY_LOSS_PCT` | 5% | Circuit breaker — stop trading if account drops 5% intraday |
@@ -236,75 +289,176 @@ Configured in `config.py`:
 | `STOP_LOSS_PCT` | -3% | Bracket-order stop-loss |
 | `MAX_CONSECUTIVE_TICKER_DAYS` | 3 | Don't trade same ticker more than 3 days in a row |
 
-Alpaca handles bracket exits server-side, so no intraday monitoring process is needed.
+Alpaca handles bracket exits server-side, so no intraday monitoring process is needed. Orders are `time_in_force: day` market entries with attached take-profit limit + stop-loss stop. If a position isn't closed by 4:00 PM ET, Alpaca cancels the remaining bracket at end of day.
+
+## A/B timing experiment: dual paper accounts
+
+This is the headline operational change as of May 2026. We run the same signals through two separate Alpaca paper accounts at two different times of day to compare execution timing without confounding from day-to-day market drift.
+
+| | Account OPEN | Account DELAYED |
+|---|---|---|
+| **Trade fire time** | 9:15 AM ET (orders queue, fill at 9:30 opening auction) | 10:00 AM ET (fill at intraday price) |
+| **Workflow** | [daily_trade.yml](.github/workflows/daily_trade.yml) | [daily_trade_delayed.yml](.github/workflows/daily_trade_delayed.yml) |
+| **Signal source** | Re-generated from morning data | Loaded from morning's saved watchlist artifact |
+| **Alpaca keys** | `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` | `ALPACA_API_KEY_DELAYED` / `ALPACA_SECRET_KEY_DELAYED` |
+| **Trade log** | `output/trade_log_open.csv` | `output/trade_log_delayed.csv` |
+| **Telegram tag** | `*Spike Trader [OPEN] — DATE*` | `*Spike Trader [DELAYED] — DATE*` |
+
+**Hypothesis being tested:** The first 20–30 minutes of trading is dominated by retail order flow ("amateur hour"). For our long-biased signals on liquid mega-cap tech, waiting until ~10 AM may produce better fills on average. The DELAYED account tests this.
+
+**Why dual accounts beats sequential testing:** Running 9:30 fills for 3 weeks then switching to 10:00 fills for 3 weeks confounds market-condition differences across the windows. Running them in parallel — same signals, same day, only timing differs — eliminates that.
+
+**Both accounts start at $100k.** Compare equity after ~3–4 weeks of trading.
+
+**Critical detail:** the DELAYED workflow does **not** regenerate predictions at 10:00 AM. It loads the 9:15 watchlist artifact (`watchlist-YYYY-MM-DD`) and trades that. Regenerating at 10:00 would leak intraday news into the sentiment features (Finnhub returns articles published since the last call, with no time-of-day filter) — predictions would be artificially "accurate" because they'd already know what happened in the morning. The saved-artifact path is the only way to keep the comparison fair.
 
 ## Automation
 
-### Cloudflare Worker → GitHub Actions
+### Cloudflare Worker
 
-A Cloudflare Worker cron triggers GitHub Actions workflows via `workflow_dispatch`. The Worker is **DST-aware and holiday-aware** — it schedules two crons per slot (one for EDT, one for EST), dispatches only when NY local time matches the intended slot, and skips weekday slots on NYSE market holidays. The holiday list lives in `worker.js` and needs annual update against [nyse.com/markets/hours-calendars](https://www.nyse.com/markets/hours-calendars). Sunday retrain runs regardless (uses historical data only).
+A small Cloudflare Worker fires cron triggers, checks NY local time (DST-aware), checks the date against a hardcoded NYSE holiday set, and dispatches the appropriate GitHub Actions workflow via the API. Worker source: `~/spike-scheduler/` (separate from this repo).
 
-| Slot (ET) | Workflow | Purpose |
+**Cron triggers (consolidated; one line per slot covers both EDT and EST):**
+
+```toml
+[triggers]
+crons = [
+  "15 13,14 * * 1-5",   # 9:15 AM ET Mon-Fri → daily_trade.yml
+  "0 14,15 * * 1-5",    # 10:00 AM ET Mon-Fri → daily_trade_delayed.yml
+  "30 20,21 * * 1-5",   # 4:30 PM ET Mon-Fri → daily_validate.yml
+  "0 11,12 * * 7",      # 7:00 AM ET Sunday  → retrain.yml
+]
+```
+
+4 cron lines total — under the Cloudflare free-tier limit of 5. Each line fires at both the EDT (winter) and EST (summer) UTC offsets; the worker's runtime guard at `resolveWorkflow(ny)` only dispatches when NY local time matches the intended slot, so DST switches require zero manual intervention.
+
+**Holiday handling:** `MARKET_HOLIDAYS` in `worker.js` is a hardcoded Set of YYYY-MM-DD strings for full-closure NYSE holidays through 2027. Weekday slots skip dispatch on these days. Sunday retrain runs regardless (uses historical data only). The list needs annual update against [nyse.com/markets/hours-calendars](https://www.nyse.com/markets/hours-calendars).
+
+**Manual trigger (bypasses both guards):**
+```bash
+curl 'https://spike-scheduler.<subdomain>.workers.dev/?workflow=daily_trade.yml'
+```
+
+### GitHub Actions workflows
+
+| Workflow | Cron-triggered at | What it does | Uploads as artifact |
+|---|---|---|---|
+| `daily_trade.yml` | Mon–Fri 9:15 AM ET | Predict + Telegram watchlist + trade OPEN + Telegram [OPEN] confirmations | `watchlist-YYYY-MM-DD` (date-stable name for downstream pickup) + `daily-output-<run_id>` (full output dir) |
+| `daily_trade_delayed.yml` | Mon–Fri 10:00 AM ET | Download morning watchlist + trade DELAYED + Telegram [DELAYED] confirmations | `delayed-trade-YYYY-MM-DD` (trade log) |
+| `daily_validate.yml` | Mon–Fri 4:30 PM ET | Download morning watchlist + fetch actuals via yfinance + update rolling metrics + Telegram validation summary | `validation-YYYY-MM-DD` (rolling state) |
+| `retrain.yml` | Sunday 7:00 AM ET | Build 2-year training set + retrain two-stage XGBoost + upload model | `spike-model` (consumed by daily workflows) |
+| `daily_predict.yml` | (manual only) | Prediction-only run for debugging — no trades | `watchlist-<run_id>` |
+
+**Key cross-workflow dependency:** daily workflows download the `spike-model` artifact from the most recent successful `retrain.yml` run. The download step uses `dawidd6/action-download-artifact@v3` with `workflow: retrain.yml` and `workflow_conclusion: success` — without `workflow:` it would default to searching the current workflow's artifacts and never find anything (this was a real 10-day-silent bug fixed in commit `3fb60fb`).
+
+### State persistence (GitHub Actions cache + artifacts)
+
+GitHub Actions runners are stateless. State that needs to live across runs uses one of two mechanisms:
+
+| State | Mechanism | Cache key | Lives in |
+|---|---|---|---|
+| Finnhub news cache | `actions/cache@v4` | `spike-data-cache-<run_id>` w/ prefix restore | `data/news_cache/` |
+| Earnings cache | same | same | `data/earnings_cache/` |
+| Telegram subscriber list | `actions/cache@v4` | `telegram-subscribers-<run_id>` w/ prefix restore | `data/subscribers.json` |
+| Validation rolling state | `actions/cache@v4` | `validation-state-<run_id>` w/ prefix restore | `output/validation_state/` |
+| Delayed trade log | `actions/cache@v4` | `trade-log-delayed-<run_id>` w/ prefix restore | `output/trade_log_delayed.csv` |
+| Trained model | upload-artifact | `spike-model` (latest successful retrain.yml) | `data/model_s1.json`, `model_s2.json`, `model_meta.json` |
+| Daily watchlist | upload-artifact | `watchlist-YYYY-MM-DD` (date-stable) | `output/watchlist_YYYY-MM-DD.csv` |
+
+The cache pattern is: key is unique per run (`-<run_id>` suffix), restore-keys is the prefix only. So every run restores the most recently saved snapshot, modifies it, then saves a fresh copy under a new key. No race conditions because the daily workflows never run concurrently.
+
+### Telegram broadcast (multi-recipient)
+
+Every send goes to the **owner** (chat_id from `TELEGRAM_CHAT_ID` env) plus any chat_ids that have sent `/start` to the bot. The `/start` listener is implemented as polling: each `notify.py` invocation calls Telegram's `getUpdates` first, registers new subscribers (and removes `/stop` senders), persists the list to `data/subscribers.json`, then broadcasts.
+
+| Daily message | When | Sender |
 |---|---|---|
-| Mon–Fri 9:15 AM | `daily_trade.yml` | Predictions + paper trades + Telegram |
-| Mon–Fri 4:30 PM | `daily_validate.yml` | Pred-vs-actual + rolling metrics + Telegram |
-| Sunday 7:00 AM | `retrain.yml` | Weekly model retrain |
+| Watchlist | 9:15 AM ET (after prediction) | `notify.py` |
+| `[OPEN]` trade confirmation | 9:15 AM ET (after trade.py) | `notify.py --trades --label open` |
+| `[DELAYED]` trade confirmation | 10:00 AM ET (after delayed trade.py) | `notify.py --trades --label delayed` |
+| Validation summary | 4:30 PM ET | `notify.py --validate` |
 
-`daily_predict.yml` also exists for prediction-only manual runs (no trades).
+**Caveat:** Telegram only retains undelivered `/start` messages for ~24 hours. If a friend sends `/start` Friday afternoon and the next workflow run is Tuesday morning (over a long weekend), the message may expire before being polled. Workaround: manually run `python predict/notify.py --poll-only` locally, or have the friend re-send `/start` on a trading morning.
 
-Required GitHub Secrets: `FINNHUB_API_KEY`, `ALPACA_API_KEY`, `ALPACA_SECRET_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`
+### Validation feedback loop
 
-### Validation Feedback Loop
+`backtest/daily_validation.py` runs every weekday at 4:30 PM ET. For each ticker in the morning watchlist:
 
-After market close each weekday, `daily_validation.py` downloads the morning's watchlist (stable-named artifact `watchlist-YYYY-MM-DD`), pulls actual intraday returns via yfinance, and appends to a rolling state cached across runs:
+1. Fetch today's actual OHLC bar via yfinance
+2. Classify the actual intraday return as `SPIKE UP` / `SPIKE DOWN` / `FLAT`
+3. Compare against predicted class (derived from `p_spike` vs `TRADE_THRESHOLD` and `p_up` vs `p_down`)
+4. Append to rolling per-day state
 
-- `output/validation_state/history.csv` — per-ticker per-day prediction vs actual
-- `output/validation_state/metrics.csv` — per-day aggregate metrics (accuracy, precision, recall, direction accuracy, signal P&L proxy)
-- `output/validation_state/trend.png` — 4-panel chart showing how each metric evolves over time
+State files in `output/validation_state/`:
+- `history.csv` — per-ticker per-day prediction vs actual
+- `metrics.csv` — per-day aggregate metrics (accuracy, spike precision, spike recall, direction accuracy on caught spikes, signal P&L proxy)
+- `trend.png` — 4-panel chart auto-regenerated each run, showing how each metric evolves over time with 10-day rolling averages
 
-The Telegram summary surfaces today's numbers plus a 10-day rolling average and cumulative signal P&L. The cache key is `validation-state-<run_id>` with `restore-keys: validation-state-`, so each run pulls the latest snapshot, appends today, and saves a new version.
+Telegram summary surfaces today's numbers plus the 10-day rolling average + cumulative signal P&L. The signal P&L proxy assumes you took every `SPIKE UP` long and every `SPIKE DOWN` short and held to the close — it's not real P&L (no slippage, no TP/SL, no position sizing) but it's directionally informative.
 
-### Telegram
+## Recent changes
 
-Three notifications per trading day:
-1. **9:15 AM** — Prediction watchlist (from `spike_detector.py`)
-2. **9:15 AM** — Trade confirmations (from `trade.py`)
-3. **4:30 PM** — Validation summary (from `daily_validation.py`)
+### May 2026 — Dual-account A/B + Alpaca bug fix
 
-## Recent Changes
+- **Fixed Alpaca data API URL.** Market data endpoints live on `data.alpaca.markets`, not `paper-api.alpaca.markets`. `get_latest_price()` was hitting the wrong host, returning 404, and silently skipping every order. This blocked all paper trades for the first ~10 days the workflow was running. Commit `5d5d993`.
+- **Split execution into two workflows for A/B timing test.** OPEN account trades at 9:30 auction, DELAYED account trades at 10:00 from the same morning watchlist. Both start at $100k. Same commit.
+- **Multi-recipient Telegram via `/start` polling.** Friends can subscribe by sending `/start` to the bot; chat_ids persist in `data/subscribers.json` across runs. Commit `13c734f`.
+- **Holiday-aware Cloudflare Worker.** Hardcoded NYSE holiday set through 2027 — weekday slots skip on closures (e.g., Memorial Day 2026-05-25 didn't fire). Commit `423faf1`.
+- **DST-aware scheduling.** Worker fires at both EDT and EST UTC offsets per slot; runtime guard dispatches only when NY local time matches.
+- **Daily post-market validation workflow.** Lightweight pred-vs-actual that doesn't retrain — runs in ~2 min vs ~30+ min for the heavy `validate_today.py`. Commit `6a01d63`.
+- **Fixed `download-artifact` defaulting to current workflow.** Daily workflows now explicitly point at `retrain.yml` to find `spike-model`. This had silently broken every scheduled daily_predict run for 10+ days. Commit `3fb60fb`.
 
-### May 2026 — Restructure + Reliability
+### Model improvements (May 11–22, 2026)
 
-- Reorganized into `predict/` and `backtest/` folders for clarity
-- Added Telegram trade confirmations as a separate message after order placement
-- Moved scheduling from in-repo cron to Cloudflare Worker → GitHub Actions (frees us from GitHub's flaky cron timing)
-- Added disk caching for OHLCV downloads to speed up retrains
-- Shifted daily run from ~7 AM to **9:15 AM ET** to capture full overnight news flow + BMO earnings while leaving a 15-minute buffer to the open
-
-### Model Improvements
-
-- **Dropped `realized_vol_20d` from Stage 1.** It accounted for 10.3% of feature importance — 2x the next feature — teaching the model "volatile stock = spike" rather than detecting actual spike conditions. `vol_z_score` remains to capture relative volatility shifts.
-- **Stage 2 now trains on spike + near-spike samples** instead of all samples. The previous approach (training on all ~29,000 rows) introduced a bearish bias from the 88% flat days. The new approach uses ~10,000 rows of days with meaningful directional moves, improving direction accuracy from 65% to 92.6% on the validation set.
-- **Stage 2 heavily regularized** — `max_depth=3`, `min_child_weight=20`, `gamma=1.0`, `reg_alpha=1.0`, `reg_lambda=5.0` — to combat overfitting (was 92% val / 50% live).
+- **Dropped `realized_vol_20d` from Stage 1.** It accounted for 10.3% of feature importance — 2× the next feature — teaching the model "volatile stock = spike" rather than detecting actual spike conditions. `vol_z_score` remains to capture relative volatility shifts.
+- **Stage 2 now trains on spike + near-spike samples** instead of all samples. Direction accuracy went from 65% → 92.6% on the validation set.
+- **Stage 2 heavily regularized** — `max_depth=3`, `min_child_weight=20`, `gamma=1.0`, `reg_alpha=1.0`, `reg_lambda=5.0` — to combat val/live divergence.
 - **Added `scale_pos_weight`** for Stage 1 class imbalance instead of manual sample weights.
 
-### Feature Expansion
+### Feature expansion (May 2026)
 
-- **+8 lagged macro features** — 3-day and 5-day variants of VIX, DXY, oil, gold, treasury, SP500 — so single-day blips don't drown out sustained regime shifts
-- **+5 earnings features** — EPS surprise, revenue surprise, streak, post-earnings drift, earnings-day volatility
+- **+8 lagged macro features** — 3-day and 5-day variants of VIX, DXY, oil, gold, treasury, SP500
+- **+5 earnings features** — EPS/rev surprise, beat-miss streak, post-earnings drift, earnings-day volatility
 - **+5 macro features** — yield curve spread, USD index, crude oil, gold, SP500 5-day return
 - **+2 sentiment features** — news count z-score, news spike flag
 - **+2 technical features** — volatility z-score, overnight gap
 
-### Expanded Universe
+### Universe expansion
 
-27 → 60 tickers across biotech, energy, financials, consumer, industrial, and more semiconductors. Training data roughly doubled from ~13,500 to ~30,000 rows.
+27 → 60 tickers across biotech, energy, financials, consumer, industrial, more semiconductors. Training data roughly doubled from ~13,500 to ~30,000 rows.
 
-## Design Decisions
+## Design decisions
 
-- **No lookahead bias** — every feature uses only data available before 9:30 AM ET
-- **Time-series validation** — most recent 20% of data as validation (no shuffle)
-- **Adaptive thresholds** — per-ticker spike definition based on historical volatility
-- **Aggressive caching** — Finnhub news, earnings data, and OHLCV cached to disk under `data/`
-- **Graceful degradation** — missing earnings or news data defaults to 0, model still runs
-- **Server-side bracket exits** — Alpaca manages TP/SL, no intraday process needed
+- **No lookahead bias** — every feature uses only data available before 9:30 AM ET. yfinance's `end` parameter is exclusive, so today's bar is never pulled into technical features.
+- **Time-series validation** — most recent 20% of training data as validation. No shuffle. Prevents leakage that would inflate val scores.
+- **Adaptive thresholds** — per-ticker spike definition based on historical volatility; prevents mega-cap tech from being "always spiking."
+- **Aggressive caching** — Finnhub news, earnings data, and OHLCV cached to disk under `data/`. Retrains go from ~30 min cold to ~3 min warm.
+- **Graceful degradation** — missing earnings or news data defaults to 0; model still runs. (Macro NaNs are NOT zeroed because "0% VIX change" is a real signal, not absence.)
+- **Server-side bracket exits** — Alpaca manages TP/SL after order fill. No intraday monitor process needed.
+- **Stable-named artifacts for cross-workflow handoff** — `watchlist-YYYY-MM-DD` rather than `<run_id>` so downstream workflows can find by date without knowing the upstream run ID.
+- **Per-account state isolation** — OPEN and DELAYED have separate trade logs, separate API keys, separate Alpaca accounts. No cross-contamination of the A/B experiment.
+
+## Known caveats
+
+- **News leakage if predictions run after market open.** Finnhub returns all articles in a date range with no time filter. Running predictions at 3 PM ET would include 10 AM news in "overnight" sentiment features, artificially inflating accuracy. This is why the DELAYED workflow loads the saved 9:15 watchlist instead of regenerating predictions.
+- **24-hour Telegram /start expiry.** If no workflow runs within ~24 hours of someone sending `/start`, their subscription may be dropped from `getUpdates`. Workaround: manual `--poll-only` run or re-send `/start` on a trading morning.
+- **Cloudflare Worker free-tier cap of 5 crons.** Currently using 4. Adding more slots requires consolidation (hour lists like `13,14`) or upgrading the plan.
+- **NYSE holiday list is hardcoded.** Update annually against the official NYSE calendar. Last updated through 2027.
+- **Paper data feed is IEX only.** `get_latest_price()` uses `feed=iex` — the free-tier feed. Prices are accurate but represent only IEX flow, not the full SIP consolidated tape. For position sizing, this is fine; for sub-second backtesting, it's not.
+- **No real P&L tracking yet.** Validation metrics include a "signal P&L proxy" but the system doesn't pull realized P&L from Alpaca's order history. This is a future enhancement; for now, log into the Alpaca dashboard once a week to see equity.
+
+## Anti-features (deliberately not built)
+
+- **No intraday monitoring process.** Alpaca handles bracket exits server-side. No need for a long-running daemon.
+- **No webhook listener for Telegram.** Polling via `getUpdates` is enough for a daily-cadence bot and avoids running a public HTTP server.
+- **No retraining inside the daily workflow.** Retraining happens once a week on Sunday. Daily workflows download the artifact. Keeps daily runs fast (~3 min) and avoids non-determinism from retraining mid-week.
+
+## Files an AI assistant would want to read first
+
+If you're an LLM trying to understand this codebase quickly, start with:
+
+1. [config.py](config.py) — universe, feature columns, all tunable knobs in one place
+2. [predict/spike_detector.py](predict/spike_detector.py) — the predict + retrain entry point; everything else hangs off this
+3. [predict/trade.py](predict/trade.py) — Alpaca integration, position sizing, risk filters
+4. [.github/workflows/daily_trade.yml](.github/workflows/daily_trade.yml) — the canonical workflow; daily_trade_delayed and daily_validate are variations
+5. The "System architecture" Mermaid diagram above for the overall data flow
