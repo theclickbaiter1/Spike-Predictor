@@ -42,6 +42,12 @@ TAKE_PROFIT_PCT = 0.05           # Bracket order take-profit at +5%
 STOP_LOSS_PCT = 0.03             # Bracket order stop-loss at -3%
 MAX_CONSECUTIVE_TICKER_DAYS = 3  # Don't trade same ticker >3 days in a row
 
+# Limit-order entry: only fill if price moves against the signal by this much
+# (i.e. a "dip" for LONG, a "rip" for SHORT) before we enter. Day-bound; if
+# no fill by 4pm Alpaca cancels. Tradeoff: cleaner average entry price,
+# but you skip days that gap-and-run without a pullback.
+LIMIT_ENTRY_DIP_PCT = 0.005      # 0.5% favorable move required to fill
+
 # ── Ticker Universe (~58 tickers) ────────────────────────────────────────────
 UNIVERSE = [
     # Original — Mega-cap Tech

@@ -30,6 +30,7 @@ from config import (
     ALPACA_PAPER_URL,
     ALPACA_SECRET_KEY,
     FEATURE_COLUMNS,
+    LIMIT_ENTRY_DIP_PCT,
     MAX_CONSECUTIVE_TICKER_DAYS,
     MAX_DAILY_LOSS_PCT,
     MAX_POSITIONS_PER_DAY,
@@ -84,21 +85,27 @@ class AlpacaClient:
     def get_orders(self, status="open"):
         return self._request("GET", f"/v2/orders?status={status}&limit=100")
 
-    def place_bracket_order(self, ticker, side, qty, take_profit_price, stop_loss_price):
+    def place_bracket_order(self, ticker, side, qty, take_profit_price, stop_loss_price,
+                            limit_price=None):
         """
-        Place a bracket order: market entry + take-profit limit + stop-loss stop.
-        Alpaca handles the OCO exit automatically.
+        Place a bracket order: entry + take-profit limit + stop-loss stop.
+        If limit_price is given the entry is a day-limit order (fills only on a
+        favorable move); otherwise it's a market order. Alpaca handles the OCO
+        exit automatically on the entry-fill side; unfilled day-limit entries
+        cancel at the close.
         """
         order = {
             "symbol": ticker,
             "qty": str(qty),
             "side": side,        # "buy" or "sell"
-            "type": "market",
+            "type": "limit" if limit_price is not None else "market",
             "time_in_force": "day",
             "order_class": "bracket",
             "take_profit": {"limit_price": f"{take_profit_price:.2f}"},
             "stop_loss": {"stop_price": f"{stop_loss_price:.2f}"},
         }
+        if limit_price is not None:
+            order["limit_price"] = f"{limit_price:.2f}"
         return self._request("POST", "/v2/orders", json_data=order)
 
     def get_latest_price(self, ticker):
@@ -136,7 +143,12 @@ def load_recent_trades(days=5, label: str = "open"):
         return {}
 
     df["date"] = pd.to_datetime(df["date"])
-    cutoff = datetime.now(ET) - timedelta(days=days)
+    # Both sides are calendar dates (no time component) — the CSV writes
+    # `now.strftime("%Y-%m-%d")` and pandas parses that as tz-naive midnight.
+    # The cutoff must match: take "today in ET" as a plain date, subtract N
+    # days, lift back to a tz-naive Timestamp. DST is irrelevant — we're
+    # comparing calendar dates, not wall-clock instants.
+    cutoff = pd.Timestamp((datetime.now(ET).date() - timedelta(days=days)))
     recent = df[df["date"] >= cutoff]
 
     # Count consecutive trading days per ticker (from most recent backward)
@@ -348,34 +360,40 @@ def execute_trades(signals, client, dry_run=False):
         else:
             price = 100.0  # Placeholder for dry run
 
-        # Calculate quantity
-        qty = int(max_position_value / price)
+        # Limit-entry price: only fill if the market moves favorably by
+        # LIMIT_ENTRY_DIP_PCT off the current quote. LONG = dip below current,
+        # SHORT = rip above current. Bracket TP/SL anchor to the limit price
+        # (the planned fill), not the current quote.
+        if direction == "LONG":
+            limit_price = round(price * (1 - LIMIT_ENTRY_DIP_PCT), 2)
+            take_profit_price = round(limit_price * (1 + TAKE_PROFIT_PCT), 2)
+            stop_loss_price = round(limit_price * (1 - STOP_LOSS_PCT), 2)
+        else:  # SHORT
+            limit_price = round(price * (1 + LIMIT_ENTRY_DIP_PCT), 2)
+            take_profit_price = round(limit_price * (1 - TAKE_PROFIT_PCT), 2)
+            stop_loss_price = round(limit_price * (1 + STOP_LOSS_PCT), 2)
+
+        # Size off the planned limit price, not the current quote.
+        qty = int(max_position_value / limit_price)
         if qty < 1:
-            print(f"    ⚠ {ticker} price ${price:.2f} too high for position size ${max_position_value:.0f}. Skipping.")
+            print(f"    ⚠ {ticker} price ${limit_price:.2f} too high for position size ${max_position_value:.0f}. Skipping.")
             continue
 
-        # Bracket order prices
-        if direction == "LONG":
-            take_profit_price = round(price * (1 + TAKE_PROFIT_PCT), 2)
-            stop_loss_price = round(price * (1 - STOP_LOSS_PCT), 2)
-        else:  # SHORT
-            take_profit_price = round(price * (1 - TAKE_PROFIT_PCT), 2)
-            stop_loss_price = round(price * (1 + STOP_LOSS_PCT), 2)
-
-        trade_value = qty * price
+        trade_value = qty * limit_price
 
         if dry_run:
-            print(f"    🏷️  {ticker:6s} {direction:5s}  {qty:4d} shares @ ~${price:.2f}"
-                  f"  (${trade_value:,.0f})  TP=${take_profit_price:.2f}  SL=${stop_loss_price:.2f}"
+            print(f"    🏷️  {ticker:6s} {direction:5s}  {qty:4d} shares @ limit ${limit_price:.2f}"
+                  f"  (ref ${price:.2f}, ${trade_value:,.0f})  TP=${take_profit_price:.2f}  SL=${stop_loss_price:.2f}"
                   f"  P(spike)={sig['p_spike']*100:.0f}%")
             order_id = "DRY-RUN"
         else:
-            print(f"    📤 {ticker:6s} {direction:5s}  {qty:4d} shares @ market"
-                  f"  TP=${take_profit_price:.2f}  SL=${stop_loss_price:.2f}"
+            print(f"    📤 {ticker:6s} {direction:5s}  {qty:4d} shares @ limit ${limit_price:.2f}"
+                  f"  (ref ${price:.2f})  TP=${take_profit_price:.2f}  SL=${stop_loss_price:.2f}"
                   f"  P(spike)={sig['p_spike']*100:.0f}%", end=" ", flush=True)
 
             result = client.place_bracket_order(
-                ticker, side, qty, take_profit_price, stop_loss_price
+                ticker, side, qty, take_profit_price, stop_loss_price,
+                limit_price=limit_price,
             )
             if result:
                 order_id = result.get("id", "unknown")
@@ -390,7 +408,7 @@ def execute_trades(signals, client, dry_run=False):
             "ticker": ticker,
             "direction": direction,
             "qty": qty,
-            "entry_price": round(price, 2),
+            "entry_price": limit_price,
             "take_profit": take_profit_price,
             "stop_loss": stop_loss_price,
             "p_spike": round(sig["p_spike"], 4),
