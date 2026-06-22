@@ -50,6 +50,25 @@ jobs:
           search_artifacts: true
           if_no_artifact_found: warn
 
+      - name: EOD close — OPEN account
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+        run: python predict/trade.py --paper --label open --close-all
+
+      - name: EOD close — DELAYED account
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY_DELAYED }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY_DELAYED }}
+        run: python predict/trade.py --paper --label delayed --close-all
+
+      - name: Send EOD close summary to Telegram
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python predict/notify.py --eod-close
+
       - name: Run validation
         run: python backtest/daily_validation.py
 

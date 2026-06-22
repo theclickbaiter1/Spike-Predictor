@@ -33,15 +33,17 @@ def time_series_split(X, y, val_frac=VAL_FRACTION):
     return X.iloc[:split_idx], y.iloc[:split_idx], X.iloc[split_idx:], y.iloc[split_idx:]
 
 
-def _near_spike_mask(y, intraday_ret, threshold_frac=0.5):
+def _near_spike_mask(y, intraday_ret, adaptive_threshold=None, threshold_frac=0.5):
     """
     Select spike samples + near-spike samples (return > 50% of spike threshold).
     This gives Stage 2 enough data to learn direction without flat-day bias.
     """
     is_spike = y != 1
-    # Near-spike: not a spike but absolute return > threshold_frac × SPIKE_THRESHOLD
-    # These are days with meaningful directional moves, just below the spike cutoff
-    is_near_spike = (~is_spike) & (intraday_ret.abs() >= SPIKE_THRESHOLD * threshold_frac)
+    if adaptive_threshold is not None:
+        near_thresh = adaptive_threshold * threshold_frac
+    else:
+        near_thresh = SPIKE_THRESHOLD * threshold_frac
+    is_near_spike = (~is_spike) & (intraday_ret.abs() >= near_thresh)
     mask = is_spike | is_near_spike
     return mask
 
@@ -59,7 +61,8 @@ class TwoStageModel:
         self.best_rounds_s2 = 300
 
     def train(self, X_train, y_train, X_val, y_val,
-              ret_train=None, ret_val=None):
+              ret_train=None, ret_val=None,
+              thresh_train=None, thresh_val=None):
         """
         Train both stages with early stopping.
         y values: 0=spike_down, 1=flat, 2=spike_up
@@ -98,8 +101,8 @@ class TwoStageModel:
         print("\n  ▶ Stage 2: Direction Classifier (spike + near-spike samples)")
 
         if ret_train is not None:
-            train_mask = _near_spike_mask(y_train, ret_train)
-            val_mask = _near_spike_mask(y_val, ret_val) if ret_val is not None else (y_val != 1)
+            train_mask = _near_spike_mask(y_train, ret_train, thresh_train)
+            val_mask = _near_spike_mask(y_val, ret_val, thresh_val) if ret_val is not None else (y_val != 1)
         else:
             # Fallback: spike-only if no return data
             train_mask = y_train != 1
@@ -141,7 +144,7 @@ class TwoStageModel:
 
         return self.best_rounds_s1, self.best_rounds_s2
 
-    def retrain_full(self, X, y, intraday_ret=None):
+    def retrain_full(self, X, y, intraday_ret=None, adaptive_threshold=None):
         """Retrain on full dataset using discovered optimal rounds."""
         print(f"\n  Retraining on full dataset ({len(X)} rows)...")
 
@@ -158,7 +161,7 @@ class TwoStageModel:
 
         # Stage 2: spike + near-spike samples
         if intraday_ret is not None:
-            mask = _near_spike_mask(y, intraday_ret)
+            mask = _near_spike_mask(y, intraday_ret, adaptive_threshold)
             X_s2 = X[mask]
             y_s2 = (intraday_ret[mask] > 0).astype(int)
         else:
@@ -173,6 +176,16 @@ class TwoStageModel:
         self.direction_model.fit(X_s2, y_s2, verbose=False)
 
         print("  Full retrain complete.")
+
+    def spike_val_metrics(self, X_val, y_val, threshold=0.5):
+        """Spike detection precision/recall/F1 on a validation set."""
+        X_s1 = X_val[S1_FEATURE_COLUMNS]
+        y_true = (y_val != 1).astype(int)
+        y_pred = (self.spike_model.predict_proba(X_s1)[:, 1] >= threshold).astype(int)
+        prec = precision_score(y_true, y_pred, zero_division=0)
+        rec = recall_score(y_true, y_pred, zero_division=0)
+        f1 = f1_score(y_true, y_pred, zero_division=0)
+        return {"precision": prec, "recall": rec, "f1": f1}
 
     def predict(self, X):
         """

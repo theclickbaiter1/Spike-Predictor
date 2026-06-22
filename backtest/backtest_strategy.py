@@ -107,7 +107,7 @@ def run_backtest(train_until, trade_start, trade_end, threshold):
     client = FinnhubClient()
     scorer = FinBERTScorer()
 
-    X_all, y_all, ret_all, tickers_all = build_training_dataset(
+    X_all, y_all, ret_all, tickers_all, adaptive_all = build_training_dataset(
         UNIVERSE, client, scorer, end_date_str=trade_end
     )
 
@@ -121,6 +121,7 @@ def run_backtest(train_until, trade_start, trade_end, threshold):
     X_train_full = X_all[train_mask]
     y_train_full = y_all[train_mask]
     ret_train_full = ret_all[train_mask]
+    adaptive_train_full = adaptive_all[train_mask]
 
     X_trade = X_all[trade_mask].copy()
     ret_trade = ret_all[trade_mask]
@@ -134,10 +135,12 @@ def run_backtest(train_until, trade_start, trade_end, threshold):
     X_tr, y_tr, X_val, y_val = time_series_split(X_train_full, y_train_full)
     ret_tr = ret_train_full.iloc[:len(X_tr)]
     ret_val = ret_train_full.iloc[len(X_tr):]
+    thresh_tr = adaptive_train_full.iloc[:len(X_tr)]
+    thresh_val = adaptive_train_full.iloc[len(X_tr):]
 
     model = TwoStageModel()
-    model.train(X_tr, y_tr, X_val, y_val, ret_tr, ret_val)
-    model.retrain_full(X_train_full, y_train_full, ret_train_full)
+    model.train(X_tr, y_tr, X_val, y_val, ret_tr, ret_val, thresh_tr, thresh_val)
+    model.retrain_full(X_train_full, y_train_full, ret_train_full, adaptive_train_full)
 
     print("\n  Top 10 Spike Feature Importances:")
     importance = model.get_spike_feature_importance()

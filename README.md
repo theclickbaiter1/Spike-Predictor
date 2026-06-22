@@ -29,7 +29,7 @@ flowchart TB
         C1[9:15 AM ET cron → daily_trade.yml]
         C2[10:00 AM ET cron → daily_trade_delayed.yml]
         C3[4:30 PM ET cron → daily_validate.yml]
-        C4[Sunday 7:00 AM ET cron → retrain.yml]
+        C4[Sunday 7:00 AM ET cron → retrain.yml (bi-weekly)]
     end
 
     subgraph Sources["External Data Sources"]
@@ -44,7 +44,7 @@ flowchart TB
         GTR[daily_trade.yml<br/>predict + Telegram + trade OPEN]
         GDEL[daily_trade_delayed.yml<br/>load watchlist + trade DELAYED]
         GVAL[daily_validate.yml<br/>actuals + rolling metrics]
-        GRET[retrain.yml<br/>weekly model rebuild]
+        GRET[retrain.yml<br/>bi-weekly model rebuild]
     end
 
     subgraph Model["Two-Stage XGBoost — 45 features"]
@@ -54,7 +54,7 @@ flowchart TB
     end
 
     subgraph State["Persistent State (GHA Cache + Artifacts)"]
-        ART_MODEL[(spike-model<br/>weekly retrain artifact)]
+        ART_MODEL[(spike-model<br/>bi-weekly retrain artifact)]
         ART_WL[(watchlist-YYYY-MM-DD<br/>9:15 AM watchlist)]
         ART_VAL[(validation-state<br/>history, metrics, trend chart)]
         ART_SUBS[(subscribers.json<br/>Telegram /start chat_ids)]
@@ -136,8 +136,9 @@ flowchart TB
     ├── daily_predict.yml          # Prediction-only manual run (workflow_dispatch only)
     ├── daily_trade.yml            # 9:15 AM ET — predict + trade OPEN account
     ├── daily_trade_delayed.yml    # 10:00 AM ET — trade morning watchlist on DELAYED account
-    ├── daily_validate.yml         # 4:30 PM ET — pred-vs-actual rolling metrics
-    └── retrain.yml                # Sunday 7 AM ET — weekly retrain
+    ├── daily_validate.yml         # 4:30 PM ET — EOD close + pred-vs-actual rolling metrics
+    ├── retrain.yml                # Sunday 7 AM ET — bi-weekly retrain (even ISO weeks)
+    └── weekly_validate.yml        # Saturday 8 AM ET — heavy OOS weekly validation
 ```
 
 The Cloudflare Worker source lives outside this repo at `~/spike-scheduler/` (separate concern, separate deploy). It's just `worker.js` + `wrangler.toml` — see [Cloudflare Worker](#cloudflare-worker) below.
@@ -289,7 +290,7 @@ Configured in [config.py](config.py):
 | `STOP_LOSS_PCT` | -3% | Bracket-order stop-loss |
 | `MAX_CONSECUTIVE_TICKER_DAYS` | 3 | Don't trade same ticker more than 3 days in a row |
 
-Alpaca handles bracket exits server-side, so no intraday monitoring process is needed. Orders are `time_in_force: day` market entries with attached take-profit limit + stop-loss stop. If a position isn't closed by 4:00 PM ET, Alpaca cancels the remaining bracket at end of day.
+Alpaca bracket orders use take-profit (+5%) and stop-loss (-3%) for intraday exits. At 4:30 PM ET the `daily_validate.yml` workflow **liquidates any remaining open positions** on both paper accounts (`--close-all`) before running validation — so unfilled bracket legs that expired at 4 PM do not leave positions open overnight.
 
 ## A/B timing experiment: dual paper accounts
 
@@ -310,13 +311,22 @@ This is the headline operational change as of May 2026. We run the same signals 
 
 **Both accounts start at $100k.** Compare equity after ~3–4 weeks of trading.
 
+**After resetting a paper account on the Alpaca dashboard:** API keys are invalidated. Generate new keys (Paper Trading → API Keys), update `.env` locally, and update GitHub secrets `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` (and `_DELAYED` variants for the second account). Verify with:
+
+```bash
+python predict/trade.py --paper --label open --status
+python predict/trade.py --paper --label open --close-all   # flatten any leftover positions
+```
+
 **Critical detail:** the DELAYED workflow does **not** regenerate predictions at 10:00 AM. It loads the 9:15 watchlist artifact (`watchlist-YYYY-MM-DD`) and trades that. Regenerating at 10:00 would leak intraday news into the sentiment features (Finnhub returns articles published since the last call, with no time-of-day filter) — predictions would be artificially "accurate" because they'd already know what happened in the morning. The saved-artifact path is the only way to keep the comparison fair.
 
 ## Automation
 
 ### Cloudflare Worker
 
-A small Cloudflare Worker fires cron triggers, checks NY local time (DST-aware), checks the date against a hardcoded NYSE holiday set, and dispatches the appropriate GitHub Actions workflow via the API. Worker source: `~/spike-scheduler/` (separate from this repo).
+A small Cloudflare Worker fires cron triggers, checks NY local time (DST-aware), checks the date against a hardcoded NYSE holiday set, and dispatches the appropriate GitHub Actions workflow via the API. Worker source: `~/spike-scheduler/` (see `~/spike-scheduler/README.md` for deploy).
+
+If `wrangler deploy` fails with **Authentication error [code: 10000]**, run `wrangler login` in your terminal (OAuth session expired). `account_id` is pinned in `wrangler.toml`.
 
 **Cron triggers (consolidated; one line per slot covers both EDT and EST):**
 
@@ -325,8 +335,9 @@ A small Cloudflare Worker fires cron triggers, checks NY local time (DST-aware),
 crons = [
   "15 13,14 * * 1-5",   # 9:15 AM ET Mon-Fri → daily_trade.yml
   "0 14,15 * * 1-5",    # 10:00 AM ET Mon-Fri → daily_trade_delayed.yml
-  "30 20,21 * * 1-5",   # 4:30 PM ET Mon-Fri → daily_validate.yml
-  "0 11,12 * * 7",      # 7:00 AM ET Sunday  → retrain.yml
+  "30 20,21 * * 1-5",   # 4:30 PM ET Mon-Fri → daily_validate.yml (+ EOD close)
+  "0 12,13 * * 6",      # 8:00 AM ET Saturday → weekly_validate.yml
+  "0 11,12 * * 7",      # 7:00 AM ET Sunday  → retrain.yml (bi-weekly, even ISO weeks)
 ]
 ```
 
@@ -346,7 +357,8 @@ curl 'https://spike-scheduler.<subdomain>.workers.dev/?workflow=daily_trade.yml'
 | `daily_trade.yml` | Mon–Fri 9:15 AM ET | Predict + Telegram watchlist + trade OPEN + Telegram [OPEN] confirmations | `watchlist-YYYY-MM-DD` (date-stable name for downstream pickup) + `daily-output-<run_id>` (full output dir) |
 | `daily_trade_delayed.yml` | Mon–Fri 10:00 AM ET | Download morning watchlist + trade DELAYED + Telegram [DELAYED] confirmations | `delayed-trade-YYYY-MM-DD` (trade log) |
 | `daily_validate.yml` | Mon–Fri 4:30 PM ET | Download morning watchlist + fetch actuals via yfinance + update rolling metrics + Telegram validation summary | `validation-YYYY-MM-DD` (rolling state) |
-| `retrain.yml` | Sunday 7:00 AM ET | Build 2-year training set + retrain two-stage XGBoost + upload model | `spike-model` (consumed by daily workflows) |
+| `retrain.yml` | Sunday 7:00 AM ET (bi-weekly) | Build 2-year training set + retrain two-stage XGBoost + upload model | `spike-model` (consumed by daily workflows) |
+| `weekly_validate.yml` | Saturday 8:00 AM ET | Heavy OOS `validate_week.py` retrain + predict prior week | `weekly-validation-*` artifacts |
 | `daily_predict.yml` | (manual only) | Prediction-only run for debugging — no trades | `watchlist-<run_id>` |
 
 **Key cross-workflow dependency:** daily workflows download the `spike-model` artifact from the most recent successful `retrain.yml` run. The download step uses `dawidd6/action-download-artifact@v3` with `workflow: retrain.yml` and `workflow_conclusion: success` — without `workflow:` it would default to searching the current workflow's artifacts and never find anything (this was a real 10-day-silent bug fixed in commit `3fb60fb`).
@@ -442,7 +454,7 @@ Telegram summary surfaces today's numbers plus the 10-day rolling average + cumu
 
 - **News leakage if predictions run after market open.** Finnhub returns all articles in a date range with no time filter. Running predictions at 3 PM ET would include 10 AM news in "overnight" sentiment features, artificially inflating accuracy. This is why the DELAYED workflow loads the saved 9:15 watchlist instead of regenerating predictions.
 - **24-hour Telegram /start expiry.** If no workflow runs within ~24 hours of someone sending `/start`, their subscription may be dropped from `getUpdates`. Workaround: manual `--poll-only` run or re-send `/start` on a trading morning.
-- **Cloudflare Worker free-tier cap of 5 crons.** Currently using 4. Adding more slots requires consolidation (hour lists like `13,14`) or upgrading the plan.
+- **Cloudflare Worker free-tier cap of 5 crons.** All 5 slots are in use (trade, delayed trade, daily validate, weekly validate, bi-weekly retrain). Adding more requires consolidation or upgrading the plan.
 - **NYSE holiday list is hardcoded.** Update annually against the official NYSE calendar. Last updated through 2027.
 - **Paper data feed is IEX only.** `get_latest_price()` uses `feed=iex` — the free-tier feed. Prices are accurate but represent only IEX flow, not the full SIP consolidated tape. For position sizing, this is fine; for sub-second backtesting, it's not.
 - **No real P&L tracking yet.** Validation metrics include a "signal P&L proxy" but the system doesn't pull realized P&L from Alpaca's order history. This is a future enhancement; for now, log into the Alpaca dashboard once a week to see equity.
@@ -451,7 +463,7 @@ Telegram summary surfaces today's numbers plus the 10-day rolling average + cumu
 
 - **No intraday monitoring process.** Alpaca handles bracket exits server-side. No need for a long-running daemon.
 - **No webhook listener for Telegram.** Polling via `getUpdates` is enough for a daily-cadence bot and avoids running a public HTTP server.
-- **No retraining inside the daily workflow.** Retraining happens once a week on Sunday. Daily workflows download the artifact. Keeps daily runs fast (~3 min) and avoids non-determinism from retraining mid-week.
+- **No retraining inside the daily workflow.** Retraining happens bi-weekly on Sunday (even ISO weeks). Daily workflows download the artifact. Keeps daily runs fast (~3 min) and avoids non-determinism from retraining mid-week.
 
 ## Files an AI assistant would want to read first
 

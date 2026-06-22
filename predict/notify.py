@@ -14,6 +14,8 @@ Usage:
     python predict/notify.py                        # Send today's watchlist
     python predict/notify.py --trades               # Trade confirmations
     python predict/notify.py --validate             # Validation summary
+    python predict/notify.py --validate-week        # Weekly OOS validation summary
+    python predict/notify.py --eod-close            # EOD position close summary
     python predict/notify.py --file <path>          # Custom watchlist CSV
     python predict/notify.py --poll-only            # Just register /start; send no message
 """
@@ -290,6 +292,78 @@ def format_validation_summary(metrics_csv: str = None) -> str:
     return "\n".join(lines)
 
 
+def format_eod_close_summary() -> str:
+    """Format EOD position close logs for both accounts."""
+    import json
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = [f"*EOD Close — {today}*\n"]
+
+    for label in ("open", "delayed"):
+        path = OUTPUT_DIR / f"eod_close_{label}.json"
+        tag = label.upper()
+        if not path.exists():
+            lines.append(f"*{tag}:* No positions closed (or no log).")
+            continue
+        with open(path) as f:
+            records = json.load(f)
+        if not records:
+            lines.append(f"*{tag}:* No open positions.")
+            continue
+        lines.append(f"*{tag}:* Closed {len(records)} position(s)")
+        for r in records:
+            pl = r.get("unrealized_pl", 0)
+            pl_emoji = "🟢" if pl >= 0 else "🔴"
+            lines.append(
+                f"  `{r['ticker']:<6}` {r['direction']} {r['qty']} sh  "
+                f"{pl_emoji} P&L ${pl:+.2f}"
+            )
+
+    return "\n".join(lines)
+
+
+def format_weekly_validation_summary(csv_path: str = None) -> str:
+    """Format the latest weekly OOS validation results for Telegram."""
+    import pandas as pd
+
+    if csv_path:
+        path = Path(csv_path)
+    else:
+        weekly_dir = OUTPUT_DIR / "validation_state" / "weekly"
+        if weekly_dir.exists():
+            candidates = sorted(weekly_dir.glob("validation_*.csv"), reverse=True)
+            path = candidates[0] if candidates else None
+        else:
+            path = None
+
+    if not path or not path.exists():
+        return "*Weekly Validation* — No results yet."
+
+    df = pd.read_csv(path)
+    if df.empty:
+        return "*Weekly Validation* — Empty results file."
+
+    total = len(df)
+    correct = int(df["correct"].sum())
+    actual_spikes = df[df["actual_class"] != "FLAT"]
+    pred_spikes = df[df["pred_class"] != "FLAT"]
+    caught = actual_spikes[actual_spikes["pred_class"] != "FLAT"]
+    true_pos = pred_spikes[pred_spikes["actual_class"] != "FLAT"]
+    dir_correct = true_pos[true_pos["pred_class"] == true_pos["actual_class"]]
+
+    date_range = f"{df['date'].min()} → {df['date'].max()}"
+    lines = [f"*Weekly OOS Validation — {date_range}*\n"]
+    lines.append(f"📊 Accuracy: *{correct/total*100:.1f}%* ({correct}/{total})")
+    lines.append(f"🎯 Spike precision: *{len(true_pos)/len(pred_spikes)*100:.0f}%* "
+                 f"({len(pred_spikes)} predicted)" if len(pred_spikes) else "🎯 Spike precision: N/A")
+    lines.append(f"🔍 Spike recall: *{len(caught)/len(actual_spikes)*100:.0f}%* "
+                 f"({len(actual_spikes)} actual)" if len(actual_spikes) else "🔍 Spike recall: N/A")
+    if len(true_pos):
+        lines.append(f"↕️ Direction acc: *{len(dir_correct)/len(true_pos)*100:.0f}%* (on true spikes)")
+
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--file", type=str, help="Path to watchlist CSV")
@@ -297,6 +371,10 @@ def main():
                         help="Send trade execution summary instead of watchlist")
     parser.add_argument("--validate", action="store_true",
                         help="Send daily validation summary instead of watchlist")
+    parser.add_argument("--validate-week", action="store_true",
+                        help="Send weekly OOS validation summary")
+    parser.add_argument("--eod-close", action="store_true",
+                        help="Send EOD position close summary")
     parser.add_argument("--poll-only", action="store_true",
                         help="Poll for /start and /stop commands; do not send any broadcast")
     parser.add_argument("--label", type=str, default="open",
@@ -310,6 +388,16 @@ def main():
 
     if args.validate:
         msg = format_validation_summary()
+        send_telegram(msg)
+        return
+
+    if args.validate_week:
+        msg = format_weekly_validation_summary()
+        send_telegram(msg)
+        return
+
+    if args.eod_close:
+        msg = format_eod_close_summary()
         send_telegram(msg)
         return
 

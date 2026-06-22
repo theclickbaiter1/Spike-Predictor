@@ -58,17 +58,20 @@ def main():
 
     # Phase 1: Train
     print("\n  Phase 1: Training...")
-    X, y, intraday_ret, _ = build_training_dataset(
+    X, y, intraday_ret, _, adaptive_thresh = build_training_dataset(
         UNIVERSE, client, scorer, end_date_str=train_until
     )
 
     X_train, y_train, X_val, y_val = time_series_split(X, y)
     ret_train = intraday_ret.iloc[:len(X_train)]
     ret_val = intraday_ret.iloc[len(X_train):]
+    thresh_train = adaptive_thresh.iloc[:len(X_train)]
+    thresh_val = adaptive_thresh.iloc[len(X_train):]
 
     model = TwoStageModel()
-    model.train(X_train, y_train, X_val, y_val, ret_train, ret_val)
-    model.retrain_full(X, y, intraday_ret)
+    model.train(X_train, y_train, X_val, y_val, ret_train, ret_val,
+                thresh_train, thresh_val)
+    model.retrain_full(X, y, intraday_ret, adaptive_thresh)
     model.save()
 
     # Phase 2: Predict

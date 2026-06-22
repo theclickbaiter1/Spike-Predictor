@@ -1,0 +1,85 @@
+name: Weekly OOS Validation
+
+on:
+  # Triggered by Cloudflare Worker cron (Saturday 8 AM ET) or manual dispatch
+  workflow_dispatch:
+
+jobs:
+  weekly-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Cache news + earnings data
+        uses: actions/cache@v4
+        with:
+          path: |
+            data/news_cache
+            data/earnings_cache
+          key: spike-data-cache-${{ github.run_id }}
+          restore-keys: spike-data-cache-
+
+      - name: Cache Telegram subscribers
+        uses: actions/cache@v4
+        with:
+          path: data/subscribers.json
+          key: telegram-subscribers-${{ github.run_id }}
+          restore-keys: telegram-subscribers-
+
+      - name: Restore weekly validation state
+        uses: actions/cache@v4
+        with:
+          path: output/validation_state/weekly
+          key: weekly-validation-${{ github.run_id }}
+          restore-keys: weekly-validation-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run weekly OOS validation
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        run: python backtest/validate_week.py
+
+      - name: Send Telegram summary
+        if: success()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python predict/notify.py --validate-week
+
+      - name: Upload weekly validation results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: weekly-validation-${{ github.run_id }}
+          path: output/validation_state/weekly/
+          retention-days: 365
+          if-no-files-found: warn
+
+      - name: Save weekly validation cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: output/validation_state/weekly
+          key: weekly-validation-${{ github.run_id }}
+
+      - name: Notify Telegram on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d parse_mode=Markdown \
+            -d text="*Weekly Validation* — weekly_validate.yml failed. Check run ${{ github.run_id }}."

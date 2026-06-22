@@ -27,7 +27,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from config import OUTPUT_DIR, SPIKE_THRESHOLD, TRADE_THRESHOLD, UNIVERSE
+from config import OUTPUT_DIR, TRADE_THRESHOLD, UNIVERSE
+from features import classify_intraday_return, fetch_adaptive_threshold
 
 STATE_DIR = OUTPUT_DIR / "validation_state"
 HISTORY_CSV = STATE_DIR / "history.csv"
@@ -35,12 +36,9 @@ METRICS_CSV = STATE_DIR / "metrics.csv"
 TREND_PNG = STATE_DIR / "trend.png"
 
 
-def classify(ret: float) -> str:
-    if ret >= SPIKE_THRESHOLD:
-        return "SPIKE UP"
-    if ret <= -SPIKE_THRESHOLD:
-        return "SPIKE DOWN"
-    return "FLAT"
+def classify(ret: float, ticker: str, date_str: str) -> str:
+    threshold = fetch_adaptive_threshold(ticker, date_str)
+    return classify_intraday_return(ret, threshold)
 
 
 def fetch_actuals(date_str: str) -> dict:
@@ -180,7 +178,7 @@ def main():
         if ticker not in actuals:
             continue
         actual_ret = actuals[ticker]["intraday_return"]
-        actual_class = classify(actual_ret)
+        actual_class = classify(actual_ret, ticker, date_str)
         pred_dir = "UP" if r["p_up"] > r["p_down"] else "DOWN"
         pred_class = "FLAT" if r["p_spike"] < TRADE_THRESHOLD else f"SPIKE {pred_dir}"
 

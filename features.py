@@ -51,6 +51,48 @@ def compute_adaptive_target(ohlcv: pd.DataFrame, multiplier: float = ADAPTIVE_MU
     return target
 
 
+def compute_adaptive_threshold_series(ohlcv: pd.DataFrame, multiplier: float = ADAPTIVE_MULTIPLIER) -> pd.Series:
+    """Per-day adaptive spike threshold (aligned with compute_adaptive_target)."""
+    intraday_return = (ohlcv["Close"] - ohlcv["Open"]) / ohlcv["Open"]
+    abs_return = intraday_return.abs()
+    avg_abs = abs_return.rolling(20, min_periods=10).mean().shift(1)
+    return (avg_abs * multiplier).clip(lower=SPIKE_THRESHOLD)
+
+
+def classify_intraday_return(ret: float, threshold: float = None) -> str:
+    """Classify an intraday return using flat or adaptive threshold."""
+    th = SPIKE_THRESHOLD if threshold is None else threshold
+    if ret >= th:
+        return "SPIKE UP"
+    if ret <= -th:
+        return "SPIKE DOWN"
+    return "FLAT"
+
+
+# Features filled with 0 when missing (same list used in training + prediction)
+OPTIONAL_FILL_COLS = [
+    "eps_surprise_last", "revenue_surprise_last", "earnings_streak",
+    "post_earnings_drift_1d", "earnings_volatility",
+    "vix_change_3d", "vix_change_5d", "vix_regime",
+    "dxy_change_5d", "crude_oil_change_5d", "gold_change_5d",
+    "treasury_10y_delta_5d", "sp500_return_3d",
+]
+
+
+def impute_features_for_predict(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    Align prediction-time feature handling with training:
+    fill optional NaNs with 0, drop rows missing required (macro) features.
+    """
+    X = X.copy()
+    for col in OPTIONAL_FILL_COLS:
+        if col in X.columns:
+            X[col] = X[col].fillna(0)
+    required = [c for c in FEATURE_COLUMNS if c not in OPTIONAL_FILL_COLS]
+    valid = X[required].notna().all(axis=1)
+    return X.loc[valid]
+
+
 def compute_target(df: pd.DataFrame) -> pd.Series:
     """Legacy flat-threshold target (kept for backward compatibility)."""
     intraday_return = (df["Close"] - df["Open"]) / df["Open"]
@@ -228,11 +270,10 @@ def compute_calendar_features(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFr
     cal["day_of_week"] = dates.dayofweek
     cal["is_monday"] = (dates.dayofweek == 0).astype(int)
     cal["is_friday"] = (dates.dayofweek == 4).astype(int)
-    cal["days_to_earnings"] = 90  # Default: "no known upcoming earnings"
+    cal["days_to_earnings"] = 90  # Default: no known upcoming earnings
     cal["is_earnings_day"] = 0
 
-    # Use cached earnings data (reliable) instead of yfinance earnings_dates (flaky).
-    # The cache has actual historical earnings dates from _fetch_earnings_data().
+    # Point-in-time: only use reported historical earnings (no yfinance future dates).
     earnings_data = _fetch_earnings_data(ticker)
     earnings_dates_list = []
     for rec in earnings_data:
@@ -241,35 +282,25 @@ def compute_calendar_features(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFr
         except Exception:
             continue
 
-    # Also try yfinance for future earnings dates not yet in cache
-    try:
-        t = yf.Ticker(ticker)
-        if hasattr(t, "earnings_dates") and t.earnings_dates is not None:
-            for d in t.earnings_dates.index:
-                earnings_dates_list.append(pd.Timestamp(d).normalize())
-        elif hasattr(t, "calendar") and t.calendar is not None:
-            cd = t.calendar
-            if isinstance(cd, dict) and "Earnings Date" in cd:
-                for d in pd.to_datetime(cd["Earnings Date"]):
-                    earnings_dates_list.append(pd.Timestamp(d).normalize())
-    except Exception:
-        pass
-
     if not earnings_dates_list:
         return cal
 
     earnings_dates = pd.DatetimeIndex(sorted(set(earnings_dates_list)))
 
-    # Vectorized: for each date, find days to next earnings
     for idx, d in enumerate(dates):
         d_norm = pd.Timestamp(d).normalize()
-        future = earnings_dates[earnings_dates >= d_norm]
-        if len(future) > 0:
-            days = (future[0] - d_norm).days
-            cal.iloc[idx, cal.columns.get_loc("days_to_earnings")] = min(days, 90)
-            if days == 0:
-                cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
-        # Day after earnings = earnings impact day
+        # Only earnings already reported on or before d_norm (no lookahead)
+        known = earnings_dates[earnings_dates <= d_norm]
+        if len(known) == 0:
+            continue
+
+        if d_norm in known:
+            cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
+            cal.iloc[idx, cal.columns.get_loc("days_to_earnings")] = 0
+        else:
+            days_since = (d_norm - known[-1]).days
+            cal.iloc[idx, cal.columns.get_loc("days_to_earnings")] = min(days_since, 90)
+
         yesterday_was_earnings = earnings_dates[earnings_dates == d_norm - timedelta(days=1)]
         if len(yesterday_was_earnings) > 0:
             cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
@@ -563,10 +594,12 @@ def build_training_dataset(
 
         # Adaptive target + raw intraday return (for near-spike filtering in model)
         target = compute_adaptive_target(ohlcv)
+        adaptive_thresh = compute_adaptive_threshold_series(ohlcv)
         intraday_return = (ohlcv["Close"] - ohlcv["Open"]) / ohlcv["Open"]
         ticker_features["_ticker"] = ticker
         ticker_features["_target"] = target
         ticker_features["_intraday_return"] = intraday_return
+        ticker_features["_adaptive_threshold"] = adaptive_thresh
 
         start_ts = pd.Timestamp(start_date)
         ticker_features = ticker_features[ticker_features.index >= start_ts]
@@ -585,6 +618,7 @@ def build_training_dataset(
     print(f"\n  [4/4] Finalizing dataset...")
     y_raw = combined["_target"]
     intraday_ret = combined["_intraday_return"]
+    adaptive_thresh = combined["_adaptive_threshold"]
     X = combined[FEATURE_COLUMNS].copy()
     y = y_raw.map(LABEL_MAP)
     # Pre-market + earnings features are optional — fill NaN with 0
@@ -592,15 +626,7 @@ def build_training_dataset(
     # Only fill features where NaN genuinely means "no data = no signal".
     # Macro features are NOT filled here — a 0% change is a real signal,
     # not "missing". They stay NaN and get dropped by valid_mask if absent.
-    optional_fill_cols = [
-        "eps_surprise_last", "revenue_surprise_last", "earnings_streak",
-        "post_earnings_drift_1d", "earnings_volatility",
-        # Lagged macro — NaN means not enough history for the rolling window,
-        # 0 is a safe fill (no momentum signal)
-        "vix_change_3d", "vix_change_5d", "vix_regime",
-        "dxy_change_5d", "crude_oil_change_5d", "gold_change_5d",
-        "treasury_10y_delta_5d", "sp500_return_3d",
-    ]
+    optional_fill_cols = OPTIONAL_FILL_COLS
     for col in optional_fill_cols:
         if col in X.columns:
             X[col] = X[col].fillna(0)
@@ -611,6 +637,7 @@ def build_training_dataset(
     X = X[valid_mask]
     y = y[valid_mask].astype(int)
     intraday_ret = intraday_ret[valid_mask]
+    adaptive_thresh = adaptive_thresh[valid_mask]
     tickers = tickers[valid_mask]
 
     print(f"\n  Dataset built: {len(X)} rows × {len(FEATURE_COLUMNS)} features")
@@ -618,7 +645,24 @@ def build_training_dataset(
         count = (y == label_idx).sum()
         print(f"    {name}: {count} ({count/len(y)*100:.1f}%)")
 
-    return X, y, intraday_ret, tickers
+    return X, y, intraday_ret, tickers, adaptive_thresh
+
+
+def fetch_adaptive_threshold(ticker: str, date_str: str) -> float:
+    """Adaptive spike threshold for a ticker on a given calendar date."""
+    ts = pd.Timestamp(date_str)
+    start = (ts - timedelta(days=60)).strftime("%Y-%m-%d")
+    end = (ts + timedelta(days=1)).strftime("%Y-%m-%d")
+    ohlcv = _download_safe(ticker, start, end)
+    if ohlcv.empty:
+        return SPIKE_THRESHOLD
+    thresh = compute_adaptive_threshold_series(ohlcv)
+    if ts in thresh.index and pd.notna(thresh.loc[ts]):
+        return float(thresh.loc[ts])
+    prior = thresh[thresh.index <= ts]
+    if len(prior) > 0 and pd.notna(prior.iloc[-1]):
+        return float(prior.iloc[-1])
+    return SPIKE_THRESHOLD
 
 
 # ── Single-Day Feature Builder (for live prediction) ────────────────────────

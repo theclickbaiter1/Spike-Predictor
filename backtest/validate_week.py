@@ -17,7 +17,8 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from config import FEATURE_COLUMNS, MODEL_PATH, SPIKE_THRESHOLD, UNIVERSE
+from config import FEATURE_COLUMNS, MODEL_PATH, OUTPUT_DIR, TRADE_THRESHOLD, UNIVERSE
+from features import classify_intraday_return, fetch_adaptive_threshold, impute_features_for_predict
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -32,13 +33,9 @@ def download_safe(ticker, start, end):
         return pd.DataFrame()
 
 
-def classify_return(ret):
-    if ret >= SPIKE_THRESHOLD:
-        return "SPIKE UP"
-    elif ret <= -SPIKE_THRESHOLD:
-        return "SPIKE DOWN"
-    else:
-        return "FLAT"
+def classify_return(ret, ticker, date_str):
+    threshold = fetch_adaptive_threshold(ticker, date_str)
+    return classify_intraday_return(ret, threshold)
 
 
 # ── Phase 1: Train on data up to May 9 ──────────────────────────────────────
@@ -55,7 +52,7 @@ def train_model(train_until):
     client = FinnhubClient()
     scorer = FinBERTScorer()
 
-    X, y, intraday_ret, _ = build_training_dataset(
+    X, y, intraday_ret, _, adaptive_thresh = build_training_dataset(
         UNIVERSE, client, scorer, end_date_str=train_until
     )
 
@@ -64,9 +61,12 @@ def train_model(train_until):
     X_train, y_train, X_val, y_val = time_series_split(X, y)
     ret_train = intraday_ret.iloc[: len(X_train)]
     ret_val = intraday_ret.iloc[len(X_train) :]
+    thresh_train = adaptive_thresh.iloc[: len(X_train)]
+    thresh_val = adaptive_thresh.iloc[len(X_train) :]
 
     model = TwoStageModel()
-    model.train(X_train, y_train, X_val, y_val, ret_train, ret_val)
+    model.train(X_train, y_train, X_val, y_val, ret_train, ret_val,
+                thresh_train, thresh_val)
 
     print("\n  Top 10 Spike Feature Importances:")
     importance = model.get_spike_feature_importance()
@@ -74,7 +74,7 @@ def train_model(train_until):
         bar = "█" * int(score * 100)
         print(f"    {feat:30s} {score:.3f} {bar}")
 
-    model.retrain_full(X, y, intraday_ret)
+    model.retrain_full(X, y, intraday_ret, adaptive_thresh)
     model.save()
     print("\n  ✅ Model saved.\n")
     return model
@@ -127,11 +127,14 @@ def predict_and_compare(model, test_start, test_end):
 
         X_pred = pd.DataFrame(feature_rows).T
         X_pred.columns = FEATURE_COLUMNS
-        X_pred = X_pred.fillna(0)
+        X_pred = impute_features_for_predict(X_pred)
+        if X_pred.empty:
+            print("  No valid tickers for prediction (missing macro data).")
+            continue
         probs = model.predict(X_pred)
 
         # Fetch actuals for this date
-        for ticker in UNIVERSE:
+        for ticker in X_pred.index:
             actual_data = download_safe(ticker, date_str, next_day_str)
             if actual_data.empty or len(actual_data) == 0:
                 continue
@@ -141,8 +144,8 @@ def predict_and_compare(model, test_start, test_end):
 
             p = probs.loc[ticker]
             pred_dir = "UP" if p["p_up"] > p["p_down"] else "DOWN"
-            pred_class = "FLAT" if p["p_spike"] < 0.40 else f"SPIKE {pred_dir}"
-            actual_class = classify_return(actual_ret)
+            pred_class = "FLAT" if p["p_spike"] < TRADE_THRESHOLD else f"SPIKE {pred_dir}"
+            actual_class = classify_return(actual_ret, ticker, date_str)
 
             all_results.append(
                 {
@@ -207,13 +210,13 @@ def print_summary(df):
 
     # Side-by-side: show biggest movers
     print(f"\n  {'─' * 63}")
-    print(f"  TOP MOVERS vs PREDICTIONS (|return| > 3%)")
+    print(f"  TOP MOVERS vs PREDICTIONS (adaptive spike threshold)")
     print(f"  {'─' * 63}")
-    big_movers = df[df["actual_return"].abs() >= SPIKE_THRESHOLD].sort_values(
+    big_movers = df[df["actual_class"] != "FLAT"].sort_values(
         "actual_return", key=abs, ascending=False
     )
     if len(big_movers) == 0:
-        print("  No moves > 3% in this period.")
+        print("  No adaptive-threshold spikes in this period.")
     else:
         print(f"  {'Date':<12} {'Ticker':<7} {'Predicted':<14} {'P(spike)':<10} {'Actual':<10} {'Return':>8} {'✓?'}")
         print(f"  {'─' * 63}")
@@ -241,8 +244,11 @@ def print_summary(df):
                 f"{r['p_spike'] * 100:6.1f}%   {r['actual_class']:<10} {r['actual_return'] * 100:>+7.2f}%  {check}"
             )
 
-    # Save CSV
-    csv_path = f"output/validation_{df['date'].min()}_{df['date'].max()}.csv"
+    # Save CSV to weekly validation state dir
+    weekly_dir = OUTPUT_DIR / "validation_state" / "weekly"
+    weekly_dir.mkdir(parents=True, exist_ok=True)
+    csv_name = f"validation_{df['date'].min()}_{df['date'].max()}.csv"
+    csv_path = weekly_dir / csv_name
     df.to_csv(csv_path, index=False)
     print(f"\n  📄 Full results saved to {csv_path}")
 
@@ -250,12 +256,11 @@ def print_summary(df):
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def _default_dates():
-    """Default: train up to last Friday, test this Monday-Friday."""
+    """Default: train up to last Friday, test the Mon-Fri week that just ended."""
     today = datetime.now()
-    # Find last Friday
     days_since_friday = (today.weekday() - 4) % 7
-    if days_since_friday == 0 and today.hour < 16:
-        days_since_friday = 7
+    if days_since_friday == 0:
+        days_since_friday = 7  # On Friday/Sat/Sun use the Friday that ended last week
     last_friday = today - timedelta(days=days_since_friday)
     train_until = last_friday.strftime("%Y-%m-%d")
     # Test week = Monday after that Friday

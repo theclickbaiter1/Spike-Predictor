@@ -142,17 +142,15 @@ def data_quality_report(X, y, intraday_ret):
     if suspicious == 0:
         print("    ✅ All features have non-trivial value ranges.")
 
-    # Known issue: days_to_earnings lookahead bias
+    # Known issue: days_to_earnings — now point-in-time (historical only)
     if "days_to_earnings" in X.columns:
-        print(f"\n  ⚠ KNOWN ISSUE: 'days_to_earnings' has lookahead bias.")
-        print(f"    The model knows future earnings dates. This inflates backtest performance.")
-        print(f"    Consider removing in a future iteration.")
+        print(f"\n  ℹ 'days_to_earnings' uses reported historical earnings only (no lookahead).")
 
     print("─" * 65 + "\n")
 
 
 def backup_current_model():
-    """Back up the current model files before retraining."""
+    """Back up the current model files before retraining. Returns backup dir or None."""
     from pathlib import Path
 
     base = str(MODEL_PATH).replace(".json", "")
@@ -162,7 +160,7 @@ def backup_current_model():
 
     if not s1_path.exists():
         print("  No existing model to back up.")
-        return
+        return None
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
     backup_dir = MODEL_BACKUP_DIR / f"backup_{timestamp}"
@@ -173,6 +171,23 @@ def backup_current_model():
             shutil.copy2(src, backup_dir / src.name)
 
     print(f"  📦 Current model backed up to {backup_dir}")
+    return backup_dir
+
+
+def restore_model_from_backup(backup_dir: Path):
+    """Restore model files from a backup directory."""
+    base = str(MODEL_PATH).replace(".json", "")
+    model_name = Path(base).name
+    for suffix in ["_s1.json", "_s2.json", "_meta.json"]:
+        src = backup_dir / f"{model_name}{suffix}"
+        dest = Path(f"{base}{suffix}")
+        if src.exists():
+            shutil.copy2(src, dest)
+    print(f"  ↩️  Model restored from {backup_dir}")
+
+
+# Retrain acceptance: reject new model if val F1 drops more than this vs backup
+RETRAIN_MIN_F1_DELTA = -0.03
 
 
 def run_retrain(backup=True):
@@ -184,13 +199,14 @@ def run_retrain(backup=True):
     print("  MODE: RETRAIN (2-stage model + adaptive threshold)\n")
 
     # Back up existing model
+    backup_dir = None
     if backup:
-        backup_current_model()
+        backup_dir = backup_current_model()
 
     client = FinnhubClient()
     scorer = FinBERTScorer()
 
-    X, y, intraday_ret, _ = build_training_dataset(UNIVERSE, client, scorer)
+    X, y, intraday_ret, _, adaptive_thresh = build_training_dataset(UNIVERSE, client, scorer)
 
     training_df = X.copy()
     training_df["_target"] = y
@@ -204,9 +220,37 @@ def run_retrain(backup=True):
     X_train, y_train, X_val, y_val = time_series_split(X, y)
     ret_train = intraday_ret.iloc[:len(X_train)]
     ret_val = intraday_ret.iloc[len(X_train):]
+    thresh_train = adaptive_thresh.iloc[:len(X_train)]
+    thresh_val = adaptive_thresh.iloc[len(X_train):]
+
+    # Evaluate previous model on same val split (acceptance gate)
+    old_metrics = None
+    if backup_dir is not None:
+        old_model = TwoStageModel()
+        try:
+            old_model.load()
+            old_metrics = old_model.spike_val_metrics(X_val, y_val)
+            print(f"\n  Previous model val F1: {old_metrics['f1']:.3f} "
+                  f"(prec {old_metrics['precision']:.3f}, rec {old_metrics['recall']:.3f})")
+        except Exception as e:
+            print(f"\n  ⚠ Could not load previous model for comparison: {e}")
 
     model = TwoStageModel()
-    model.train(X_train, y_train, X_val, y_val, ret_train, ret_val)
+    model.train(X_train, y_train, X_val, y_val, ret_train, ret_val,
+                thresh_train, thresh_val)
+
+    new_metrics = model.spike_val_metrics(X_val, y_val)
+    print(f"\n  New model val F1: {new_metrics['f1']:.3f} "
+          f"(prec {new_metrics['precision']:.3f}, rec {new_metrics['recall']:.3f})")
+
+    if old_metrics is not None:
+        f1_delta = new_metrics["f1"] - old_metrics["f1"]
+        if f1_delta < RETRAIN_MIN_F1_DELTA:
+            print(f"\n  🛑 RETRAIN REJECTED — val F1 dropped {f1_delta:+.3f} "
+                  f"(threshold {RETRAIN_MIN_F1_DELTA:+.3f}). Restoring backup.")
+            restore_model_from_backup(backup_dir)
+            sys.exit(1)
+        print(f"  ✅ Acceptance gate passed (F1 delta {f1_delta:+.3f})")
 
     print("\n  Top 10 Spike Detection Feature Importances:")
     importance = model.get_spike_feature_importance()
@@ -214,7 +258,7 @@ def run_retrain(backup=True):
         bar = "█" * int(score * 100)
         print(f"    {feat:30s} {score:.3f} {bar}")
 
-    model.retrain_full(X, y, intraday_ret)
+    model.retrain_full(X, y, intraday_ret, adaptive_thresh)
     model.save()
 
     print("\n  ✅ Retraining complete.")
@@ -222,7 +266,10 @@ def run_retrain(backup=True):
 
 
 def run_predict():
-    from features import build_single_day_features, _download_safe, compute_macro_features
+    from features import (
+        build_single_day_features, _download_safe, compute_macro_features,
+        impute_features_for_predict,
+    )
     from model import TwoStageModel
     from news import FinBERTScorer, FinnhubClient
 
@@ -267,11 +314,16 @@ def run_predict():
 
     X = pd.DataFrame(feature_rows).T
     X.columns = FEATURE_COLUMNS
-    X = X.fillna(0)
+    valid_tickers = list(impute_features_for_predict(X).index)
+    skipped = set(UNIVERSE) - set(valid_tickers)
+    if skipped:
+        print(f"\n  ⚠ Skipped {len(skipped)} tickers with missing macro data: "
+              f"{', '.join(sorted(skipped)[:8])}{'...' if len(skipped) > 8 else ''}")
+    X = impute_features_for_predict(X)
     probs = model.predict(X)
 
     results = []
-    for ticker in UNIVERSE:
+    for ticker in valid_tickers:
         r = probs.loc[ticker]
         results.append({
             "ticker": ticker,

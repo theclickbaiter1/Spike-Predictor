@@ -26,9 +26,11 @@ import pandas as pd
 
 from config import (
     ALPACA_API_KEY,
+    ALPACA_API_KEY_DELAYED,
     ALPACA_LIVE_URL,
     ALPACA_PAPER_URL,
     ALPACA_SECRET_KEY,
+    ALPACA_SECRET_KEY_DELAYED,
     FEATURE_COLUMNS,
     LIMIT_ENTRY_DIP_PCT,
     MAX_CONSECUTIVE_TICKER_DAYS,
@@ -47,18 +49,27 @@ from config import (
 ET = ZoneInfo("America/New_York")
 
 
+def alpaca_credentials(label: str = "open") -> tuple[str, str]:
+    """Return API key/secret for the given account label."""
+    if label == "delayed":
+        return ALPACA_API_KEY_DELAYED or ALPACA_API_KEY, ALPACA_SECRET_KEY_DELAYED or ALPACA_SECRET_KEY
+    return ALPACA_API_KEY, ALPACA_SECRET_KEY
+
+
 # ── Alpaca Client ────────────────────────────────────────────────────────────
 
 class AlpacaClient:
     """Thin wrapper around Alpaca REST API for order execution."""
 
-    def __init__(self, paper=True):
+    def __init__(self, paper=True, label: str = "open"):
         self.base_url = ALPACA_PAPER_URL if paper else ALPACA_LIVE_URL
+        api_key, secret_key = alpaca_credentials(label)
         self.headers = {
-            "APCA-API-KEY-ID": ALPACA_API_KEY,
-            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": secret_key,
         }
         self.paper = paper
+        self.label = label
 
     # Trading endpoints live on paper-api.alpaca.markets (paper) /
     # api.alpaca.markets (live). Market data endpoints live on a separate
@@ -121,6 +132,19 @@ class AlpacaClient:
 
     def cancel_all_orders(self):
         return self._request("DELETE", "/v2/orders")
+
+    def close_position(self, symbol):
+        """Close a single position at market."""
+        return self._request("DELETE", f"/v2/positions/{symbol}")
+
+    def close_all_positions(self, cancel_orders=True):
+        """
+        Liquidate all open positions at market.
+        Cancels open orders first so bracket legs don't block the close.
+        """
+        if cancel_orders:
+            self.cancel_all_orders()
+        return self._request("DELETE", "/v2/positions")
 
 
 # ── Trade History (for consecutive-day tracking) ─────────────────────────────
@@ -196,6 +220,7 @@ def log_trades(trades, label: str = "open"):
 def generate_signals():
     """Run the spike detector model and return ranked trade signals."""
     from features import _download_safe, build_single_day_features, compute_macro_features
+    from features import impute_features_for_predict
     from model import TwoStageModel
     from news import FinBERTScorer, FinnhubClient
 
@@ -237,13 +262,16 @@ def generate_signals():
 
     X = pd.DataFrame(feature_rows).T
     X.columns = FEATURE_COLUMNS
-    X = X.fillna(0)
+    X = impute_features_for_predict(X)
+    if X.empty:
+        print("  No tickers with complete macro data for signals.")
+        return []
 
     probs = model.predict(X)
 
     # Build signal list
     signals = []
-    for ticker in UNIVERSE:
+    for ticker in X.index:
         r = probs.loc[ticker]
         if r["p_spike"] >= TRADE_THRESHOLD:
             direction = "LONG" if r["p_up"] > r["p_down"] else "SHORT"
@@ -289,24 +317,47 @@ def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
 
 # ── Risk Filters ─────────────────────────────────────────────────────────────
 
-def apply_risk_filters(signals, label: str = "open"):
+def get_open_position_symbols(client) -> set[str]:
+    """Return symbols with open positions on this account."""
+    positions = client.get_positions()
+    if not positions:
+        return set()
+    return {p["symbol"] for p in positions if float(p.get("qty", 0)) != 0}
+
+
+def apply_risk_filters(signals, label: str = "open", client=None):
     """Apply risk management rules to filter and limit signals."""
+    # 0. Skip tickers already held (open positions from prior days)
+    held = set()
+    if client is not None:
+        held = get_open_position_symbols(client)
+        if held:
+            print(f"    Open positions: {', '.join(sorted(held))}")
+
     # 1. Remove tickers traded too many consecutive days
     streaks = load_recent_trades(label=label)
     filtered = []
     for sig in signals:
+        if sig["ticker"] in held:
+            print(f"    ⚠ {sig['ticker']} skipped — already holding open position")
+            continue
         streak = streaks.get(sig["ticker"], 0)
         if streak >= MAX_CONSECUTIVE_TICKER_DAYS:
             print(f"    ⚠ {sig['ticker']} skipped — traded {streak} consecutive days")
             continue
         filtered.append(sig)
 
-    # 2. Cap at MAX_POSITIONS_PER_DAY (already sorted by p_spike)
-    if len(filtered) > MAX_POSITIONS_PER_DAY:
-        dropped = filtered[MAX_POSITIONS_PER_DAY:]
+    # 2. Cap new entries: MAX_POSITIONS_PER_DAY minus existing holdings
+    slots = max(0, MAX_POSITIONS_PER_DAY - len(held))
+    if slots == 0 and filtered:
+        print(f"    ⚠ All {MAX_POSITIONS_PER_DAY} position slots filled — no new entries today")
+        return []
+    if len(filtered) > slots:
+        dropped = filtered[slots:]
         for d in dropped:
-            print(f"    ⚠ {d['ticker']} skipped — max {MAX_POSITIONS_PER_DAY} positions/day")
-        filtered = filtered[:MAX_POSITIONS_PER_DAY]
+            print(f"    ⚠ {d['ticker']} skipped — max {MAX_POSITIONS_PER_DAY} positions/day "
+                  f"({len(held)} already open)")
+        filtered = filtered[:slots]
 
     return filtered
 
@@ -420,6 +471,47 @@ def execute_trades(signals, client, dry_run=False):
     return trade_records
 
 
+def close_all_open_positions(client, dry_run=False, label: str = "open") -> list[dict]:
+    """
+    Cancel open orders and liquidate all positions at market (EOD flatten).
+    Returns a list of closed position records for logging/notify.
+    """
+    positions = client.get_positions() if not dry_run else []
+    if dry_run:
+        print("  [DRY RUN] Would cancel orders and close all positions.")
+        return []
+
+    if not positions:
+        print("  No open positions to close.")
+        return []
+
+    symbols = [p["symbol"] for p in positions]
+    print(f"  Closing {len(symbols)} position(s): {', '.join(symbols)}")
+
+    client.cancel_all_orders()
+    result = client.close_all_positions(cancel_orders=False)
+    if result is None:
+        print("  ❌ close_all_positions API call failed.")
+        return []
+
+    now = datetime.now(ET)
+    records = []
+    for p in positions:
+        records.append({
+            "date": now.strftime("%Y-%m-%d"),
+            "time": now.strftime("%H:%M:%S"),
+            "ticker": p["symbol"],
+            "direction": "LONG" if float(p.get("qty", 0)) > 0 else "SHORT",
+            "qty": abs(int(float(p.get("qty", 0)))),
+            "entry_price": float(p.get("avg_entry_price", 0)),
+            "unrealized_pl": float(p.get("unrealized_pl", 0)),
+            "label": label,
+        })
+        print(f"    ✅ Closed {p['symbol']} ({p.get('qty')} shares)")
+
+    return records
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def print_banner(mode, label):
@@ -445,6 +537,10 @@ def main():
     parser.add_argument("--watchlist", type=str, default=None,
                         help="Path to a watchlist CSV. If provided, skips signal "
                              "regeneration and trades off this snapshot.")
+    parser.add_argument("--close-all", action="store_true",
+                        help="Cancel open orders and liquidate all positions (EOD flatten)")
+    parser.add_argument("--status", action="store_true",
+                        help="Print account equity, cash, and open positions; then exit")
     args = parser.parse_args()
 
     if args.live:
@@ -465,10 +561,49 @@ def main():
             sys.exit(0)
 
     # Validate API keys (except for dry run)
-    if mode != "dry-run" and (not ALPACA_API_KEY or not ALPACA_SECRET_KEY):
-        print("\n  ❌ ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env or workflow env.")
-        print("     Sign up at https://alpaca.markets for free paper trading.")
+    api_key, secret_key = alpaca_credentials(label)
+    if mode != "dry-run" and (not api_key or not secret_key):
+        print(f"\n  ❌ Alpaca API keys must be set for label '{label}'.")
+        if label == "delayed":
+            print("     Set ALPACA_API_KEY_DELAYED and ALPACA_SECRET_KEY_DELAYED in .env")
+        else:
+            print("     Set ALPACA_API_KEY and ALPACA_SECRET_KEY in .env")
         sys.exit(1)
+
+    if args.close_all:
+        print("\n  EOD CLOSE — liquidating all open positions\n")
+        if mode == "dry-run":
+            close_all_open_positions(None, dry_run=True, label=label)
+        else:
+            client = AlpacaClient(paper=(mode == "paper"), label=label)
+            records = close_all_open_positions(client, dry_run=False, label=label)
+            if records:
+                close_log = OUTPUT_DIR / f"eod_close_{label}.json"
+                import json
+                close_log.parent.mkdir(parents=True, exist_ok=True)
+                with open(close_log, "w") as f:
+                    json.dump(records, f, indent=2)
+                print(f"\n  📄 Close log saved to {close_log}")
+        print("═" * 65)
+        return
+
+    if args.status:
+        client = AlpacaClient(paper=(mode == "paper"), label=label)
+        account = client.get_account()
+        if not account:
+            print("\n  ❌ Could not fetch account (check API keys — they change after a paper reset).")
+            sys.exit(1)
+        positions = client.get_positions() or []
+        equity = float(account["equity"])
+        print(f"\n  Account [{label.upper()}]")
+        print(f"    Equity:    ${equity:,.2f}")
+        print(f"    Cash:      ${float(account['cash']):,.2f}")
+        print(f"    Buying power: ${float(account['buying_power']):,.2f}")
+        print(f"    Positions: {len(positions)}")
+        for p in positions:
+            print(f"      {p['symbol']}: {p['qty']} @ ${float(p['avg_entry_price']):.2f}")
+        print("═" * 65)
+        return
 
     # Step 1: Get signals (regenerate or load from watchlist)
     if args.watchlist:
@@ -490,7 +625,8 @@ def main():
 
     # Step 2: Apply risk filters
     print(f"\n  Step 2: Applying risk filters...")
-    filtered = apply_risk_filters(signals, label=label)
+    trade_client = None if mode == "dry-run" else AlpacaClient(paper=(mode == "paper"), label=label)
+    filtered = apply_risk_filters(signals, label=label, client=trade_client)
 
     if not filtered:
         print("\n  All signals filtered out by risk rules. No trades today.")
@@ -503,8 +639,7 @@ def main():
     if mode == "dry-run":
         trade_records = execute_trades(filtered, None, dry_run=True)
     else:
-        client = AlpacaClient(paper=(mode == "paper"))
-        trade_records = execute_trades(filtered, client, dry_run=False)
+        trade_records = execute_trades(filtered, trade_client, dry_run=False)
 
     # Step 4: Log trades
     if trade_records:
