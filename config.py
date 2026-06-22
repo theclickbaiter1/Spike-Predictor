@@ -36,7 +36,11 @@ ALPACA_PAPER_URL = "https://paper-api.alpaca.markets"
 ALPACA_LIVE_URL = "https://api.alpaca.markets"
 
 # ── Trading Strategy ─────────────────────────────────────────────────────────
-TRADE_THRESHOLD = 0.40           # Minimum P(spike) to enter a trade
+TRADE_THRESHOLD = 0.55           # Default; overridden by data/tuned_threshold.json if present
+TRADE_PROB_COLUMN = "p_spike_trade"
+DIRECTION_MARGIN_MIN = 0.12        # min max(p_up,p_down)/p_spike to trade direction
+SECTOR_AGREEMENT_REQUIRED = True # coupling_alignment sign must match direction
+TUNED_THRESHOLD_PATH = DATA_DIR / "tuned_threshold.json"
 MAX_POSITIONS_PER_DAY = 3        # Max simultaneous positions
 MAX_POSITION_PCT = 0.10          # Max 10% of account per position
 MAX_DAILY_LOSS_PCT = 0.05        # Stop trading if account drops 5% in a day
@@ -224,3 +228,15 @@ FEATURE_COLUMNS = [
 LABEL_MAP = {-1: 0, 0: 1, 1: 2}
 LABEL_MAP_INV = {v: k for k, v in LABEL_MAP.items()}
 LABEL_NAMES = ["spike_down", "flat", "spike_up"]
+
+
+def get_trade_threshold() -> float:
+    """Load walk-forward tuned threshold if available, else TRADE_THRESHOLD."""
+    import json
+    if TUNED_THRESHOLD_PATH.exists():
+        try:
+            with open(TUNED_THRESHOLD_PATH) as f:
+                return float(json.load(f).get("threshold", TRADE_THRESHOLD))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return TRADE_THRESHOLD

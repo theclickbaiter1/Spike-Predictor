@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from config import FEATURE_COLUMNS, MODEL_PATH, OUTPUT_DIR, TRADE_THRESHOLD, UNIVERSE
+from config import FEATURE_COLUMNS, MODEL_PATH, OUTPUT_DIR, UNIVERSE, get_trade_threshold
 from features import classify_intraday_return, fetch_adaptive_threshold, impute_features_for_predict
 
 
@@ -138,7 +138,8 @@ def predict_and_compare(model, test_start, test_end):
         if X_pred.empty:
             print("  No valid tickers for prediction (missing macro data).")
             continue
-        probs = model.predict(X_pred)
+        probs = model.predict_for_trade(X_pred)
+        threshold = get_trade_threshold()
 
         # Fetch actuals for this date
         for ticker in X_pred.index:
@@ -151,7 +152,8 @@ def predict_and_compare(model, test_start, test_end):
 
             p = probs.loc[ticker]
             pred_dir = "UP" if p["p_up"] > p["p_down"] else "DOWN"
-            pred_class = "FLAT" if p["p_spike"] < TRADE_THRESHOLD else f"SPIKE {pred_dir}"
+            p_trade = float(p.get("p_spike_trade", p["p_spike"]))
+            pred_class = "FLAT" if p_trade < threshold else f"SPIKE {pred_dir}"
             actual_class = classify_return(actual_ret, ticker, date_str)
 
             all_results.append(
@@ -160,6 +162,7 @@ def predict_and_compare(model, test_start, test_end):
                     "ticker": ticker,
                     "p_spike": round(p["p_spike"], 3),
                     "p_spike_raw": round(p.get("p_spike_raw", p["p_spike"]), 3),
+                    "p_spike_trade": round(p_trade, 3),
                     "p_up": round(p["p_up"], 3),
                     "p_down": round(p["p_down"], 3),
                     "pred_class": pred_class,
@@ -178,6 +181,22 @@ def predict_and_compare(model, test_start, test_end):
 
 
 # ── Phase 3: Print summary ──────────────────────────────────────────────────
+
+def _spike_metrics(df: pd.DataFrame, prob_col: str, threshold: float) -> dict:
+    """Precision/recall using prob_col at threshold."""
+    from sklearn.metrics import f1_score, precision_score, recall_score
+
+    actual_spike = df["actual_class"] != "FLAT"
+    pred_spike = df[prob_col] >= threshold
+    if pred_spike.sum() == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0, "signals": 0}
+    return {
+        "precision": precision_score(actual_spike, pred_spike, zero_division=0),
+        "recall": recall_score(actual_spike, pred_spike, zero_division=0),
+        "f1": f1_score(actual_spike, pred_spike, zero_division=0),
+        "signals": int(pred_spike.sum()),
+    }
+
 
 def print_summary(df):
     print("\n" + "=" * 65)
@@ -215,6 +234,15 @@ def print_summary(df):
         if len(true_pos) > 0:
             dir_correct = true_pos[true_pos["pred_class"] == true_pos["actual_class"]]
             print(f"  Direction accuracy (on true spikes): {len(dir_correct)}/{len(true_pos)} ({len(dir_correct) / len(true_pos) * 100:.0f}%)")
+
+    threshold = get_trade_threshold()
+    print(f"\n  Spike metrics @ threshold {threshold:.2f} (precision-first):")
+    for label, col in [("Raw", "p_spike_raw"), ("Calibrated", "p_spike"), ("Trade", "p_spike_trade")]:
+        if col not in df.columns:
+            continue
+        m = _spike_metrics(df, col, threshold)
+        print(f"    {label:12s} prec={m['precision']:.1%} rec={m['recall']:.1%} "
+              f"F1={m['f1']:.3f} signals={m['signals']}")
 
     # Side-by-side: show biggest movers
     print(f"\n  {'─' * 63}")

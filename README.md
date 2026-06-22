@@ -233,7 +233,9 @@ p_spike_raw = Stage1.predict_proba(X)
 p_up_raw    = p_spike_raw * Stage2.predict_proba(X)
 ```
 
-Raw factorized probabilities are then passed through the **stat-mech inference layer** (see below) to produce calibrated `p_spike`, `p_up`, `p_down`, `p_flat`. Trade logs record both `p_spike_raw` and `p_spike` for A/B calibration analysis.
+Raw factorized probabilities are then passed through the **stat-mech inference layer** to produce calibrated `p_spike`, `p_up`, `p_down`, `p_flat`. **Trades use `p_spike_trade`** — a guarded blend with degeneracy bypass (falls back to raw XGBoost when the calibrator collapses, e.g. identical ~53% flags). Trade logs record `p_spike_raw`, `p_spike`, and `p_spike_trade` for A/B analysis.
+
+`TRADE_THRESHOLD` defaults to 0.55 and is overridden by `data/tuned_threshold.json` after walk-forward tuning (`backtest/tune_threshold.py`).
 
 ### Statistical mechanics hybrid layer
 
@@ -241,9 +243,9 @@ XGBoost remains the backbone learner. Three stat-mech components sit on top:
 
 1. **Feature engineering** (`stat_mech_features.py`) — sector magnetization, Shannon entropy of overnight gaps and headline scores, inverse temperature β(VIX), susceptibility/criticality proxies.
 2. **Boltzmann calibrator** (`stat_mech/calibrator.py`) — fits a 3-state Gibbs distribution on validation data, mapping XGBoost logits + local field/coupling features to a thermodynamically consistent joint law over {up, flat, down}.
-3. **Sector Ising overlay** (`stat_mech/ising.py`) — mean-field solve on same-sector couplings; blends with calibrated XGBoost via tunable λ (default 0.85, favoring XGBoost).
+3. **Sector Ising overlay** (`stat_mech/ising.py`) — mean-field solve on same-sector couplings; blends with calibrated XGBoost via tunable λ. Disabled automatically when λ=1 or bypass is active.
 
-Retrain acceptance gate rejects deploy if val F1 drops >0.03 **or** calibrated NLL worsens by >0.05 vs the backup model.
+Retrain acceptance gate rejects deploy if val F1 drops >0.03, calibrated NLL worsens by >0.05, or mini-OOS `p_spike_trade` precision falls below 20% / exceeds 15 signals/day / underperforms raw.
 
 Offline calibration benchmarks: `python backtest/compare_calibrators.py` (NLL, Brier, reliability diagram → `output/reliability_diagram.png`).
 
@@ -302,7 +304,7 @@ Configured in [config.py](config.py):
 
 | Setting | Value | Purpose |
 |---|---|---|
-| `TRADE_THRESHOLD` | 0.40 | Minimum `P(spike)` to enter a position |
+| `TRADE_THRESHOLD` | 0.55 | Minimum `P(spike_trade)` to enter a position (tuned via `tune_threshold.py`) |
 | `MAX_POSITIONS_PER_DAY` | 3 | Cap on simultaneous positions |
 | `MAX_POSITION_PCT` | 10% | Per-position cap as % of equity |
 | `MAX_DAILY_LOSS_PCT` | 5% | Circuit breaker — stop trading if account drops 5% intraday |

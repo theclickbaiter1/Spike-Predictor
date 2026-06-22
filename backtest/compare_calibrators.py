@@ -91,6 +91,7 @@ def main():
 
     raw = model.predict_raw(X_val)
     cal = model.predict(X_val)
+    trade = model.predict_for_trade(X_val)
     y_spike = (y_val != 1).astype(int).values
 
     raw_nll = model.calibrator.nll(raw, X_val, y_val) if model.calibrator.fitted else float("nan")
@@ -98,6 +99,9 @@ def main():
 
     raw_brier = brier_score_loss(y_spike, raw["p_spike"].values)
     cal_brier = brier_score_loss(y_spike, cal["p_spike"].values)
+    trade_brier = brier_score_loss(y_spike, trade["p_spike_trade"].values)
+
+    bypass_rate = float(trade.get("calibrator_bypassed", pd.Series([False])).mean())
 
     print("\n" + "=" * 55)
     print("  CALIBRATOR COMPARISON (validation split)")
@@ -107,10 +111,12 @@ def main():
     print(f"  Calibrated NLL:  {cal_nll:.4f}")
     print(f"  Raw Brier:       {raw_brier:.4f}")
     print(f"  Calibrated Brier:{cal_brier:.4f}")
-    print(f"  Ising λ:         {model.ising.lambda_blend:.3f}")
+    print(f"  Trade Brier:     {trade_brier:.4f}")
+    print(f"  Ising λ:         {model.ising.lambda_blend:.3f} (enabled={model.ising.enabled})")
+    print(f"  Calibrator bypass rate: {bypass_rate:.1%}")
 
     out_path = OUTPUT_DIR / "reliability_diagram.png"
-    plot_reliability(raw["p_spike"].values, cal["p_spike"].values, y_spike, out_path)
+    plot_reliability(raw["p_spike"].values, trade["p_spike_trade"].values, y_spike, out_path)
     print(f"\n  Reliability diagram saved to {out_path}")
 
     summary = pd.DataFrame([{
@@ -118,6 +124,8 @@ def main():
         "cal_nll": cal_nll,
         "raw_brier": raw_brier,
         "cal_brier": cal_brier,
+        "trade_brier": trade_brier,
+        "bypass_rate": bypass_rate,
         "ising_lambda": model.ising.lambda_blend,
         "n_val": len(X_val),
     }])

@@ -50,6 +50,9 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
         run: python backtest/validate_week.py
 
+      - name: Weekly precision gate
+        run: python backtest/check_weekly_precision.py
+
       - name: Send Telegram summary
         if: success()
         env:

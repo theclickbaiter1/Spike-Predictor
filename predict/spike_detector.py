@@ -205,7 +205,38 @@ def restore_model_from_backup(backup_dir: Path):
 
 # Retrain acceptance: reject new model if val F1 or calibrated NLL worsens vs backup
 RETRAIN_MIN_F1_DELTA = -0.03
-RETRAIN_MAX_NLL_DELTA = 0.05  # reject if NLL increases by more than this
+RETRAIN_MAX_NLL_DELTA = 0.05
+RETRAIN_MIN_TRADE_PRECISION = 0.20
+RETRAIN_MAX_SIGNALS_PER_DAY = 15
+
+
+def _mini_oos_gate(model, X_val, y_val) -> tuple[bool, str]:
+    """Check last 5 val trading days: trade precision vs raw baseline."""
+    dates = pd.Index(X_val.index)
+    unique_dates = sorted(dates.unique())[-5:]
+    if len(unique_dates) < 2:
+        return True, "skipped (insufficient val dates)"
+
+    mask = dates.isin(unique_dates)
+    X_slice = X_val.loc[mask]
+    y_slice = y_val.loc[mask]
+    threshold = get_trade_threshold()
+
+    trade_m = model.trade_val_metrics(X_slice, y_slice, threshold)
+    raw_m = model.spike_val_metrics(X_slice, y_slice, threshold=threshold, calibrated=False)
+    sig_per_day = trade_m["signals"] / max(len(unique_dates), 1)
+
+    reasons = []
+    if trade_m["precision"] < RETRAIN_MIN_TRADE_PRECISION:
+        reasons.append(f"trade precision {trade_m['precision']:.2f} < {RETRAIN_MIN_TRADE_PRECISION}")
+    if sig_per_day > RETRAIN_MAX_SIGNALS_PER_DAY:
+        reasons.append(f"signals/day {sig_per_day:.1f} > {RETRAIN_MAX_SIGNALS_PER_DAY}")
+    if trade_m["precision"] < raw_m["precision"]:
+        reasons.append(f"trade prec {trade_m['precision']:.2f} < raw {raw_m['precision']:.2f}")
+
+    summary = (f"mini-OOS trade prec={trade_m['precision']:.2f} rec={trade_m['recall']:.2f} "
+               f"sig/day={sig_per_day:.1f} vs raw prec={raw_m['precision']:.2f}")
+    return len(reasons) == 0, summary if not reasons else summary + " — " + "; ".join(reasons)
 
 
 def run_retrain(backup=True):
@@ -213,6 +244,7 @@ def run_retrain(backup=True):
     from model import TwoStageModel, time_series_split
     from news import FinBERTScorer, FinnhubClient
     from stat_mech.ising import sign_returns_from_training
+    from config import get_trade_threshold
 
     print_banner()
     print("  MODE: RETRAIN (2-stage model + adaptive threshold)\n")
@@ -268,9 +300,11 @@ def run_retrain(backup=True):
 
     new_metrics = model.spike_val_metrics(X_val, y_val)
     new_nll = model.calibrated_val_nll(X_val, y_val)
+    oos_ok, oos_msg = _mini_oos_gate(model, X_val, y_val)
     print(f"\n  New model val F1: {new_metrics['f1']:.3f} "
           f"(prec {new_metrics['precision']:.3f}, rec {new_metrics['recall']:.3f})")
     print(f"  New model val NLL: {new_nll:.4f}")
+    print(f"  Mini-OOS gate: {oos_msg}")
 
     if old_metrics is not None:
         f1_delta = new_metrics["f1"] - old_metrics["f1"]
@@ -285,10 +319,18 @@ def run_retrain(backup=True):
                 print(f"  🛑 RETRAIN REJECTED — val NLL increased {nll_delta:+.4f} "
                       f"(threshold {RETRAIN_MAX_NLL_DELTA:+.4f}).")
                 reject = True
+        if not oos_ok:
+            print(f"  🛑 RETRAIN REJECTED — {oos_msg}")
+            reject = True
         if reject:
             restore_model_from_backup(backup_dir)
             sys.exit(1)
         print(f"  ✅ Acceptance gate passed (F1 delta {f1_delta:+.3f})")
+    elif not oos_ok:
+        print(f"  🛑 RETRAIN REJECTED — {oos_msg}")
+        if backup_dir is not None:
+            restore_model_from_backup(backup_dir)
+        sys.exit(1)
 
     print("\n  Top 10 Spike Detection Feature Importances:")
     importance = model.get_spike_feature_importance()
@@ -298,6 +340,11 @@ def run_retrain(backup=True):
 
     model.retrain_full(X, y, intraday_ret, adaptive_thresh)
     model.save()
+
+    print("\n  Tuning trade threshold (walk-forward)...")
+    import subprocess
+    tune_script = Path(__file__).resolve().parent.parent / "backtest" / "tune_threshold.py"
+    subprocess.run([sys.executable, str(tune_script)], check=False)
 
     print("\n  ✅ Retraining complete.")
     print("═" * 65)
@@ -363,28 +410,34 @@ def run_predict():
         print(f"\n  ⚠ Skipped {len(skipped)} tickers with missing macro data: "
               f"{', '.join(sorted(skipped)[:8])}{'...' if len(skipped) > 8 else ''}")
     X = impute_features_for_predict(X)
-    probs = model.predict(X)
+    probs = model.predict_for_trade(X)
 
     results = []
     for ticker in valid_tickers:
         r = probs.loc[ticker]
+        row = feature_rows[ticker]
         results.append({
             "ticker": ticker,
             "p_spike": r["p_spike"],
             "p_spike_raw": r.get("p_spike_raw", r["p_spike"]),
+            "p_spike_trade": r.get("p_spike_trade", r["p_spike"]),
             "p_up": r["p_up"],
             "p_down": r["p_down"],
             "p_flat": r["p_flat"],
-            "top_signal": determine_top_signal(feature_rows[ticker]),
+            "calibrator_bypassed": bool(r.get("calibrator_bypassed", False)),
+            "coupling_alignment": row.get("coupling_alignment", 0),
+            "top_signal": determine_top_signal(row),
         })
 
     if not results:
         print("\n  📭 No valid predictions (missing market data). Saving empty watchlist.")
         results_df = pd.DataFrame(columns=[
-            "ticker", "p_spike", "p_spike_raw", "p_up", "p_down", "p_flat", "top_signal",
+            "ticker", "p_spike", "p_spike_raw", "p_spike_trade",
+            "p_up", "p_down", "p_flat", "calibrator_bypassed",
+            "coupling_alignment", "top_signal",
         ])
     else:
-        results_df = pd.DataFrame(results).sort_values("p_spike", ascending=False)
+        results_df = pd.DataFrame(results).sort_values("p_spike_trade", ascending=False)
         print_watchlist(results_df)
 
     date_str = today.strftime("%Y-%m-%d")

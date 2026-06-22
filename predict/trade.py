@@ -31,6 +31,7 @@ from config import (
     ALPACA_PAPER_URL,
     ALPACA_SECRET_KEY,
     ALPACA_SECRET_KEY_DELAYED,
+    DIRECTION_MARGIN_MIN,
     FEATURE_COLUMNS,
     LIMIT_ENTRY_DIP_PCT,
     MAX_CONSECUTIVE_TICKER_DAYS,
@@ -39,10 +40,12 @@ from config import (
     MAX_POSITION_PCT,
     MODEL_PATH,
     OUTPUT_DIR,
+    SECTOR_AGREEMENT_REQUIRED,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
     TRADE_LOG_PATH,
-    TRADE_THRESHOLD,
+    TRADE_PROB_COLUMN,
+    get_trade_threshold,
     UNIVERSE,
 )
 
@@ -207,7 +210,7 @@ def log_trades(trades, label: str = "open"):
     with open(path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "date", "time", "ticker", "direction", "qty", "entry_price",
-            "take_profit", "stop_loss", "p_spike", "p_spike_raw", "p_dir", "order_id", "mode",
+            "take_profit", "stop_loss", "p_spike", "p_spike_raw", "p_spike_trade", "p_dir", "order_id", "mode",
         ])
         if not file_exists:
             writer.writeheader()
@@ -216,6 +219,34 @@ def log_trades(trades, label: str = "open"):
 
 
 # ── Signal Generation ────────────────────────────────────────────────────────
+
+def passes_direction_gates(prob_row, direction: str, coupling_alignment: float) -> bool:
+    """Direction confidence + optional sector magnetization agreement."""
+    p_spike = float(prob_row.get("p_spike_trade", prob_row["p_spike"]))
+    if p_spike <= 0:
+        return False
+    p_dir = max(float(prob_row["p_up"]), float(prob_row["p_down"]))
+    if p_dir / p_spike < DIRECTION_MARGIN_MIN:
+        return False
+    if SECTOR_AGREEMENT_REQUIRED:
+        coupling = float(coupling_alignment or 0)
+        if direction == "LONG" and coupling < 0:
+            return False
+        if direction == "SHORT" and coupling > 0:
+            return False
+    return True
+
+
+def apply_top_signal_cap(signals: list[dict], max_pool: int) -> list[dict]:
+    """Raise effective threshold if too many tickers pass (Jun 18 guard)."""
+    if len(signals) <= max_pool:
+        return signals
+    signals.sort(key=lambda s: s["p_spike_trade"], reverse=True)
+    floor = signals[max_pool - 1]["p_spike_trade"]
+    capped = [s for s in signals if s["p_spike_trade"] >= floor]
+    print(f"    ⚠ Top-signal cap: {len(signals)} → {len(capped)} (floor P={floor*100:.1f}%)")
+    return capped[:max_pool]
+
 
 def generate_signals():
     """Run the spike detector model and return ranked trade signals."""
@@ -268,25 +299,33 @@ def generate_signals():
         print("  No tickers with complete macro data for signals.")
         return []
 
-    probs = model.predict(X)
+    probs = model.predict_for_trade(X)
+    threshold = get_trade_threshold()
 
     # Build signal list
     signals = []
     for ticker in X.index:
         r = probs.loc[ticker]
-        if r["p_spike"] >= TRADE_THRESHOLD:
-            direction = "LONG" if r["p_up"] > r["p_down"] else "SHORT"
-            p_dir = max(r["p_up"], r["p_down"])
-            signals.append({
-                "ticker": ticker,
-                "direction": direction,
-                "p_spike": r["p_spike"],
-                "p_spike_raw": r.get("p_spike_raw", r["p_spike"]),
-                "p_dir": p_dir,
-            })
+        p_trade = float(r.get("p_spike_trade", r["p_spike"]))
+        if p_trade < threshold:
+            continue
+        direction = "LONG" if r["p_up"] > r["p_down"] else "SHORT"
+        coupling = float(feature_rows[ticker].get("coupling_alignment", 0) or 0)
+        if not passes_direction_gates(r, direction, coupling):
+            continue
+        p_dir = max(r["p_up"], r["p_down"])
+        signals.append({
+            "ticker": ticker,
+            "direction": direction,
+            "p_spike": float(r["p_spike"]),
+            "p_spike_raw": float(r.get("p_spike_raw", r["p_spike"])),
+            "p_spike_trade": p_trade,
+            "p_dir": float(p_dir),
+            "coupling_alignment": coupling,
+        })
 
-    # Sort by spike probability descending
-    signals.sort(key=lambda s: s["p_spike"], reverse=True)
+    signals = apply_top_signal_cap(signals, MAX_POSITIONS_PER_DAY * 4)
+    signals.sort(key=lambda s: s["p_spike_trade"], reverse=True)
     return signals
 
 
@@ -303,17 +342,26 @@ def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
         sys.exit(1)
 
     df = pd.read_csv(csv_path)
+    threshold = get_trade_threshold()
+    prob_col = TRADE_PROB_COLUMN if TRADE_PROB_COLUMN in df.columns else "p_spike"
     signals = []
     for _, r in df.iterrows():
-        if float(r["p_spike"]) >= TRADE_THRESHOLD:
+        p_trade = float(r.get(prob_col, r["p_spike"]))
+        if p_trade >= threshold:
             direction = "LONG" if r["p_up"] > r["p_down"] else "SHORT"
+            coupling = float(r.get("coupling_alignment", 0) or 0)
+            if not passes_direction_gates(r, direction, coupling):
+                continue
             signals.append({
                 "ticker": r["ticker"],
                 "direction": direction,
                 "p_spike": float(r["p_spike"]),
+                "p_spike_raw": float(r.get("p_spike_raw", r["p_spike"])),
+                "p_spike_trade": p_trade,
                 "p_dir": float(max(r["p_up"], r["p_down"])),
             })
-    signals.sort(key=lambda s: s["p_spike"], reverse=True)
+    signals = apply_top_signal_cap(signals, MAX_POSITIONS_PER_DAY * 4)
+    signals.sort(key=lambda s: s["p_spike_trade"], reverse=True)
     return signals
 
 
@@ -466,6 +514,7 @@ def execute_trades(signals, client, dry_run=False):
             "stop_loss": stop_loss_price,
             "p_spike": round(sig["p_spike"], 4),
             "p_spike_raw": round(sig.get("p_spike_raw", sig["p_spike"]), 4),
+            "p_spike_trade": round(sig.get("p_spike_trade", sig["p_spike"]), 4),
             "p_dir": round(sig["p_dir"], 4),
             "order_id": order_id,
             "mode": "dry-run" if dry_run else ("paper" if client.paper else "live"),
@@ -622,9 +671,10 @@ def main():
         print("═" * 65)
         return
 
-    print(f"\n  Found {len(signals)} signals above {TRADE_THRESHOLD*100:.0f}% threshold:")
+    threshold = get_trade_threshold()
+    print(f"\n  Found {len(signals)} signals above {threshold*100:.0f}% threshold:")
     for s in signals:
-        print(f"    {s['ticker']:6s} {s['direction']:5s}  P(spike)={s['p_spike']*100:.1f}%")
+        print(f"    {s['ticker']:6s} {s['direction']:5s}  P(trade)={s['p_spike_trade']*100:.1f}%")
 
     # Step 2: Apply risk filters
     print(f"\n  Step 2: Applying risk filters...")

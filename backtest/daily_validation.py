@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
-from config import OUTPUT_DIR, TRADE_THRESHOLD, UNIVERSE
+from config import OUTPUT_DIR, TRADE_PROB_COLUMN, UNIVERSE, get_trade_threshold
 from features import classify_intraday_return, fetch_adaptive_threshold
 
 STATE_DIR = OUTPUT_DIR / "validation_state"
@@ -180,12 +180,16 @@ def main():
         actual_ret = actuals[ticker]["intraday_return"]
         actual_class = classify(actual_ret, ticker, date_str)
         pred_dir = "UP" if r["p_up"] > r["p_down"] else "DOWN"
-        pred_class = "FLAT" if r["p_spike"] < TRADE_THRESHOLD else f"SPIKE {pred_dir}"
+        prob_col = TRADE_PROB_COLUMN if TRADE_PROB_COLUMN in r.index else "p_spike"
+        p_trade = float(r.get(prob_col, r["p_spike"]))
+        threshold = get_trade_threshold()
+        pred_class = "FLAT" if p_trade < threshold else f"SPIKE {pred_dir}"
 
         per_ticker.append({
             "date": date_str,
             "ticker": ticker,
             "p_spike": float(r["p_spike"]),
+            "p_spike_trade": p_trade,
             "p_up": float(r["p_up"]),
             "p_down": float(r["p_down"]),
             "pred_class": pred_class,

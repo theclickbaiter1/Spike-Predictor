@@ -49,4 +49,5 @@ jobs:
             data/model_calibrator.json
             data/model_ising.json
             data/beta_norm.json
+            data/tuned_threshold.json
           retention-days: 365

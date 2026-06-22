@@ -19,9 +19,10 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 
 from config import (
     FEATURE_COLUMNS, MODEL_PATH, SPIKE_THRESHOLD, UNIVERSE,
-    VAL_FRACTION, XGB_PARAMS_S1, XGB_PARAMS_S2,
+    VAL_FRACTION, XGB_PARAMS_S1, XGB_PARAMS_S2, get_trade_threshold,
 )
 from stat_mech.calibrator import BoltzmannCalibrator
+from stat_mech.guards import detect_calibrator_degeneracy
 from stat_mech.ising import IsingOverlay
 
 # Stage 1 sees all features except realized_vol_20d and inverse_temperature
@@ -37,9 +38,9 @@ def time_series_split(X, y, val_frac=VAL_FRACTION):
     return X.iloc[:split_idx], y.iloc[:split_idx], X.iloc[split_idx:], y.iloc[split_idx:]
 
 
-def _near_spike_mask(y, intraday_ret, adaptive_threshold=None, threshold_frac=0.5):
+def _near_spike_mask(y, intraday_ret, adaptive_threshold=None, threshold_frac=0.35):
     """
-    Select spike samples + near-spike samples (return > 50% of spike threshold).
+    Select spike samples + near-spike samples (return > 35% of spike threshold).
     This gives Stage 2 enough data to learn direction without flat-day bias.
     """
     is_spike = y != 1
@@ -156,10 +157,11 @@ class TwoStageModel:
         print("\n  ▶ Stat-mech layers: Boltzmann calibrator + Ising overlay")
         raw_val = self.predict_raw(X_val)
         vix = X_val["vix"] if "vix" in X_val.columns else None
-        self.calibrator.fit(raw_val, X_val, y_val, vix=vix)
+        threshold = get_trade_threshold()
+        self.calibrator.fit(raw_val, X_val, y_val, vix=vix, trade_threshold=threshold)
         calibrated = self.calibrator.transform(raw_val, X_val, vix=vix)
         nll = self.calibrator.nll(raw_val, X_val, y_val, vix=vix)
-        print(f"    Calibrator val NLL: {nll:.4f}")
+        print(f"    Calibrator val NLL: {nll:.4f} (shrink={self.calibrator.shrink:.2f})")
 
         self.ising.fit_couplings(sign_returns)
         if "local_field" in X_val.columns:
@@ -167,8 +169,10 @@ class TwoStageModel:
             self.ising.fit_lambda(
                 calibrated, X_val["local_field"], y_val,
                 tickers=tickers_val, dates=dates,
+                trade_threshold=threshold,
             )
-            print(f"    Ising blend λ: {self.ising.lambda_blend:.3f}")
+            enabled = "on" if self.ising.enabled else "off"
+            print(f"    Ising blend λ: {self.ising.lambda_blend:.3f} ({enabled})")
 
     def retrain_full(self, X, y, intraday_ret=None, adaptive_threshold=None):
         """Retrain on full dataset using discovered optimal rounds."""
@@ -263,6 +267,56 @@ class TwoStageModel:
             out["p_spike_raw"] = raw["p_spike"]
 
         return out
+
+    def predict_for_trade(self, X):
+        """
+        Production inference path: calibrated + optional Ising with degeneracy bypass.
+        Returns p_spike_trade for execution; keeps p_spike / p_spike_raw for logging.
+        """
+        raw = self.predict_raw(X)
+        out = raw.copy()
+        out["p_spike_raw"] = raw["p_spike"]
+        out["calibrator_bypassed"] = False
+
+        if self.calibrator.fitted:
+            vix = X["vix"] if isinstance(X, pd.DataFrame) and "vix" in X.columns else None
+            cal = self.calibrator.transform(raw, X, vix=vix)
+            bypass = detect_calibrator_degeneracy(cal["p_spike"])
+            if bypass:
+                out = raw.copy()
+                out["p_spike_raw"] = raw["p_spike"]
+            else:
+                out = cal
+
+            out["calibrator_bypassed"] = bypass
+            if (
+                not bypass
+                and self.ising.enabled
+                and self.ising.fitted
+                and isinstance(X, pd.DataFrame)
+                and "local_field" in X.columns
+            ):
+                tickers = pd.Series(X.index, index=X.index) if set(X.index).issubset(set(UNIVERSE)) else None
+                out = self.ising.transform(out, X["local_field"], tickers=tickers)
+        else:
+            out["calibrator_bypassed"] = False
+
+        out["p_spike_trade"] = out["p_spike"]
+        return out
+
+    def trade_val_metrics(self, X_val, y_val, threshold=None):
+        """Precision/recall on p_spike_trade at trade threshold."""
+        if threshold is None:
+            threshold = get_trade_threshold()
+        probs = self.predict_for_trade(X_val)
+        y_true = (y_val != 1).astype(int)
+        y_pred = (probs["p_spike_trade"].values >= threshold).astype(int)
+        return {
+            "precision": precision_score(y_true, y_pred, zero_division=0),
+            "recall": recall_score(y_true, y_pred, zero_division=0),
+            "f1": f1_score(y_true, y_pred, zero_division=0),
+            "signals": int(y_pred.sum()),
+        }
 
     def save(self, path=MODEL_PATH):
         base = str(path).replace(".json", "")

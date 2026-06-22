@@ -191,6 +191,7 @@ class IsingOverlay:
         self.J = pd.DataFrame(0.0, index=UNIVERSE, columns=UNIVERSE)
         self.lambda_blend = ISING_LAMBDA_DEFAULT
         self.m_threshold = ISING_M_THRESHOLD
+        self.enabled = True
         self.fitted = False
 
     def fit_couplings(self, sign_returns: pd.DataFrame):
@@ -204,17 +205,21 @@ class IsingOverlay:
         tickers: pd.Series | None = None,
         dates: pd.Index | None = None,
         lam_grid: np.ndarray | None = None,
+        trade_threshold: float = 0.55,
+        min_recall: float = 0.20,
     ):
-        """Pick λ maximizing spike F1 on validation."""
-        from sklearn.metrics import f1_score
+        """Pick λ maximizing precision @ trade_threshold with recall floor."""
+        from sklearn.metrics import precision_score, recall_score
 
         if lam_grid is None:
-            lam_grid = np.linspace(0.5, 1.0, 6)
+            lam_grid = np.array([1.0, 0.95, 0.9, 0.85])
 
         y_true = (y_spike_binary != 1).astype(int).values
         use_panel = tickers is not None and dates is not None
 
-        best_lam, best_f1 = self.lambda_blend, -1.0
+        best_lam, best_prec = 1.0, -1.0
+        raw_prec_at_1 = -1.0
+
         for lam in lam_grid:
             if use_panel:
                 blended = blend_panel(
@@ -227,12 +232,20 @@ class IsingOverlay:
                 ising_df = ising_probs(m, self.m_threshold)
                 blended = blend_probs(calibrated_probs, ising_df, lam)
 
-            y_pred = (blended["p_spike"].values >= 0.5).astype(int)
-            f1 = f1_score(y_true, y_pred, zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_lam = f1, lam
+            y_pred = (blended["p_spike"].values >= trade_threshold).astype(int)
+            prec = precision_score(y_true, y_pred, zero_division=0)
+            rec = recall_score(y_true, y_pred, zero_division=0)
+            if lam == 1.0:
+                raw_prec_at_1 = prec
+            if rec < min_recall:
+                continue
+            if prec > best_prec:
+                best_prec, best_lam = prec, lam
 
         self.lambda_blend = float(best_lam)
+        self.enabled = best_lam < 1.0 and best_prec >= raw_prec_at_1
+        if not self.enabled:
+            self.lambda_blend = 1.0
         self.fitted = True
 
     def transform(
@@ -242,6 +255,10 @@ class IsingOverlay:
         tickers: pd.Series | None = None,
         dates: pd.Index | None = None,
     ) -> pd.DataFrame:
+        if not self.enabled:
+            out = calibrated_probs.copy()
+            out["p_spike_trade"] = out.get("p_spike", out["p_spike_raw"])
+            return out
         if tickers is not None and dates is not None and len(pd.Index(dates).unique()) > 1:
             return blend_panel(
                 calibrated_probs, local_fields, tickers, dates,
@@ -267,6 +284,7 @@ class IsingOverlay:
         data = {
             "lambda_blend": self.lambda_blend,
             "m_threshold": self.m_threshold,
+            "enabled": self.enabled,
             "fitted": self.fitted,
             "J": self.J.to_dict(),
         }
@@ -281,6 +299,7 @@ class IsingOverlay:
             data = json.load(f)
         self.lambda_blend = data.get("lambda_blend", ISING_LAMBDA_DEFAULT)
         self.m_threshold = data.get("m_threshold", ISING_M_THRESHOLD)
+        self.enabled = data.get("enabled", True)
         self.fitted = data.get("fitted", False)
         if "J" in data:
             self.J = pd.DataFrame(data["J"]).reindex(index=UNIVERSE, columns=UNIVERSE).fillna(0)
