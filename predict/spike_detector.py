@@ -292,14 +292,18 @@ def run_predict():
     end_str = today.strftime("%Y-%m-%d")
     start_str = (today - timedelta(days=60)).strftime("%Y-%m-%d")
 
-    # Macro
+    # Macro — use last valid row (ffill handles weekends / partial downloads)
     print("  Fetching macro data...")
     spy_data = _download_safe("^GSPC", start_str, end_str)
-    macro_df = compute_macro_features(
-        spy_data.index if not spy_data.empty else pd.DatetimeIndex([]),
-        start_str, end_str,
-    )
-    macro_cache = macro_df.iloc[-1].to_dict() if not macro_df.empty else {}
+    if spy_data.empty:
+        trading_dates = pd.bdate_range(end=pd.Timestamp(end_str), periods=30)
+    else:
+        trading_dates = spy_data.index
+    macro_df = compute_macro_features(trading_dates, start_str, end_str)
+    if not macro_df.empty:
+        macro_cache = macro_df.ffill().bfill().iloc[-1].to_dict()
+    else:
+        macro_cache = {}
 
     print(f"\n  Scanning {len(UNIVERSE)} tickers...\n")
     feature_rows = {}
@@ -334,8 +338,14 @@ def run_predict():
             "top_signal": determine_top_signal(feature_rows[ticker]),
         })
 
-    results_df = pd.DataFrame(results).sort_values("p_spike", ascending=False)
-    print_watchlist(results_df)
+    if not results:
+        print("\n  📭 No valid predictions (missing market data). Saving empty watchlist.")
+        results_df = pd.DataFrame(columns=[
+            "ticker", "p_spike", "p_up", "p_down", "p_flat", "top_signal",
+        ])
+    else:
+        results_df = pd.DataFrame(results).sort_values("p_spike", ascending=False)
+        print_watchlist(results_df)
 
     date_str = today.strftime("%Y-%m-%d")
     csv_path = OUTPUT_DIR / f"watchlist_{date_str}.csv"

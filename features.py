@@ -83,6 +83,7 @@ def impute_features_for_predict(X: pd.DataFrame) -> pd.DataFrame:
     """
     Align prediction-time feature handling with training:
     fill optional NaNs with 0, drop rows missing required (macro) features.
+    If macro edge-cases would drop every ticker, fall back to 0-fill with a warning.
     """
     X = X.copy()
     for col in OPTIONAL_FILL_COLS:
@@ -90,7 +91,11 @@ def impute_features_for_predict(X: pd.DataFrame) -> pd.DataFrame:
             X[col] = X[col].fillna(0)
     required = [c for c in FEATURE_COLUMNS if c not in OPTIONAL_FILL_COLS]
     valid = X[required].notna().all(axis=1)
-    return X.loc[valid]
+    if valid.any():
+        return X.loc[valid]
+    # Weekend / stale macro: avoid empty watchlist — degrade gracefully at predict time
+    print("  ⚠ All tickers missing required features; using 0-fill fallback for predict.")
+    return X.fillna(0)
 
 
 def compute_target(df: pd.DataFrame) -> pd.Series:
