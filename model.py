@@ -5,6 +5,8 @@ Stage 1: Binary spike detector (spike vs flat)
          — excludes realized_vol_20d (prevents "always flag volatile stocks" bias)
 Stage 2: Direction classifier (up vs down)
          — trained on spike + near-spike samples (not all samples, not spike-only)
+
+Stat-mech layers (optional): Boltzmann calibrator + sector Ising mean-field blend.
 """
 
 import json
@@ -13,16 +15,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from sklearn.metrics import classification_report, f1_score, precision_score, recall_score
+from sklearn.metrics import f1_score, precision_score, recall_score
 
 from config import (
-    FEATURE_COLUMNS, LABEL_NAMES, MODEL_PATH,
-    SPIKE_THRESHOLD, VAL_FRACTION, XGB_PARAMS_S1, XGB_PARAMS_S2,
+    FEATURE_COLUMNS, MODEL_PATH, SPIKE_THRESHOLD, UNIVERSE,
+    VAL_FRACTION, XGB_PARAMS_S1, XGB_PARAMS_S2,
 )
+from stat_mech.calibrator import BoltzmannCalibrator
+from stat_mech.ising import IsingOverlay
 
-# Stage 1 sees all features except realized_vol_20d.
-# realized_vol_20d inflates spike probability for every volatile ticker.
-_S1_EXCLUDE = {"realized_vol_20d"}
+# Stage 1 sees all features except realized_vol_20d and inverse_temperature
+# (β(VIX) is used downstream in the Boltzmann calibrator).
+_S1_EXCLUDE = {"realized_vol_20d", "inverse_temperature"}
 S1_FEATURE_COLUMNS = [c for c in FEATURE_COLUMNS if c not in _S1_EXCLUDE]
 
 
@@ -59,6 +63,8 @@ class TwoStageModel:
         self.direction_model = None
         self.best_rounds_s1 = 500
         self.best_rounds_s2 = 300
+        self.calibrator = BoltzmannCalibrator()
+        self.ising = IsingOverlay()
 
     def train(self, X_train, y_train, X_val, y_val,
               ret_train=None, ret_val=None,
@@ -144,6 +150,26 @@ class TwoStageModel:
 
         return self.best_rounds_s1, self.best_rounds_s2
 
+    def fit_stat_mech_layers(self, X_val, y_val, sign_returns: pd.DataFrame,
+                             tickers_val: pd.Series | None = None):
+        """Fit Boltzmann calibrator and Ising overlay on validation split."""
+        print("\n  ▶ Stat-mech layers: Boltzmann calibrator + Ising overlay")
+        raw_val = self.predict_raw(X_val)
+        vix = X_val["vix"] if "vix" in X_val.columns else None
+        self.calibrator.fit(raw_val, X_val, y_val, vix=vix)
+        calibrated = self.calibrator.transform(raw_val, X_val, vix=vix)
+        nll = self.calibrator.nll(raw_val, X_val, y_val, vix=vix)
+        print(f"    Calibrator val NLL: {nll:.4f}")
+
+        self.ising.fit_couplings(sign_returns)
+        if "local_field" in X_val.columns:
+            dates = X_val.index if tickers_val is not None else None
+            self.ising.fit_lambda(
+                calibrated, X_val["local_field"], y_val,
+                tickers=tickers_val, dates=dates,
+            )
+            print(f"    Ising blend λ: {self.ising.lambda_blend:.3f}")
+
     def retrain_full(self, X, y, intraday_ret=None, adaptive_threshold=None):
         """Retrain on full dataset using discovered optimal rounds."""
         print(f"\n  Retraining on full dataset ({len(X)} rows)...")
@@ -177,22 +203,31 @@ class TwoStageModel:
 
         print("  Full retrain complete.")
 
-    def spike_val_metrics(self, X_val, y_val, threshold=0.5):
-        """Spike detection precision/recall/F1 on a validation set."""
-        X_s1 = X_val[S1_FEATURE_COLUMNS]
+    def spike_val_metrics(self, X_val, y_val, threshold=0.5, calibrated=False):
+        """Spike detection precision/recall/F1 on a validation set (raw XGBoost by default)."""
+        if calibrated and self.calibrator.fitted:
+            probs = self.predict(X_val)
+            p_spike = probs["p_spike"].values
+        else:
+            X_s1 = X_val[S1_FEATURE_COLUMNS]
+            p_spike = self.spike_model.predict_proba(X_s1)[:, 1]
         y_true = (y_val != 1).astype(int)
-        y_pred = (self.spike_model.predict_proba(X_s1)[:, 1] >= threshold).astype(int)
+        y_pred = (p_spike >= threshold).astype(int)
         prec = precision_score(y_true, y_pred, zero_division=0)
         rec = recall_score(y_true, y_pred, zero_division=0)
         f1 = f1_score(y_true, y_pred, zero_division=0)
         return {"precision": prec, "recall": rec, "f1": f1}
 
-    def predict(self, X):
-        """
-        Returns DataFrame with: p_spike, p_up, p_down, p_flat
-        Stage 1 uses S1_FEATURE_COLUMNS (excl. realized_vol_20d).
-        Stage 2 uses all FEATURE_COLUMNS.
-        """
+    def calibrated_val_nll(self, X_val, y_val) -> float:
+        """Mean negative log-likelihood of 3-class labels on validation set."""
+        if not self.calibrator.fitted:
+            return float("inf")
+        raw = self.predict_raw(X_val)
+        vix = X_val["vix"] if "vix" in X_val.columns else None
+        return self.calibrator.nll(raw, X_val, y_val, vix=vix)
+
+    def predict_raw(self, X):
+        """Raw factorized XGBoost probabilities (no stat-mech layers)."""
         X_s1 = X[S1_FEATURE_COLUMNS] if isinstance(X, pd.DataFrame) else X
         p_spike = self.spike_model.predict_proba(X_s1)[:, 1]
 
@@ -208,6 +243,27 @@ class TwoStageModel:
             "p_flat": 1 - p_spike,
         }, index=X.index if hasattr(X, "index") else None)
 
+    def predict(self, X):
+        """
+        Returns DataFrame with: p_spike, p_up, p_down, p_flat, p_spike_raw
+        Applies Boltzmann calibrator and Ising overlay when fitted.
+        """
+        raw = self.predict_raw(X)
+        if self.calibrator.fitted:
+            vix = X["vix"] if isinstance(X, pd.DataFrame) and "vix" in X.columns else None
+            out = self.calibrator.transform(raw, X, vix=vix)
+        else:
+            out = raw.copy()
+            out["p_spike_raw"] = raw["p_spike"]
+
+        if self.ising.fitted and isinstance(X, pd.DataFrame) and "local_field" in X.columns:
+            tickers = pd.Series(X.index, index=X.index) if set(X.index).issubset(set(UNIVERSE)) else None
+            out = self.ising.transform(out, X["local_field"], tickers=tickers)
+        elif "p_spike_raw" not in out.columns:
+            out["p_spike_raw"] = raw["p_spike"]
+
+        return out
+
     def save(self, path=MODEL_PATH):
         base = str(path).replace(".json", "")
         self.spike_model.save_model(f"{base}_s1.json")
@@ -216,6 +272,8 @@ class TwoStageModel:
         meta = {"best_rounds_s1": self.best_rounds_s1, "best_rounds_s2": self.best_rounds_s2}
         with open(f"{base}_meta.json", "w") as f:
             json.dump(meta, f)
+        self.calibrator.save(Path(f"{base}_calibrator.json"))
+        self.ising.save(Path(f"{base}_ising.json"))
         print(f"  Model saved to {base}_s1.json + {base}_s2.json")
 
     def load(self, path=MODEL_PATH):
@@ -232,6 +290,8 @@ class TwoStageModel:
                 meta = json.load(f)
             self.best_rounds_s1 = meta.get("best_rounds_s1", 500)
             self.best_rounds_s2 = meta.get("best_rounds_s2", 300)
+        self.calibrator.load(Path(f"{base}_calibrator.json"))
+        self.ising.load(Path(f"{base}_ising.json"))
         print(f"  Model loaded from {base}_s1.json")
 
     def get_spike_feature_importance(self):

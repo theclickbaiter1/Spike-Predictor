@@ -175,7 +175,26 @@ FINNHUB_DELAY_SEC = 1.05
 FINBERT_MODEL_NAME = "ProsusAI/finbert"
 FINBERT_BATCH_SIZE = 100
 
-# ── Feature Column Order (45 features) ───────────────────────────────────────
+# ── Statistical mechanics ─────────────────────────────────────────────────────
+ISING_J_MAX = 0.3
+ISING_LAMBDA_DEFAULT = 0.85
+ISING_M_THRESHOLD = 0.15
+ISING_COUPLING_WINDOW = 60
+BETA_VIX_FLOOR = 10.0
+
+STAT_MECH_COLUMNS = [
+    "sector_magnetization",
+    "sector_abs_magnetization",
+    "local_field",
+    "coupling_alignment",
+    "cross_section_entropy",
+    "sentiment_entropy",
+    "inverse_temperature",
+    "susceptibility_proxy",
+    "criticality_proxy",
+]
+
+# ── Feature Column Order (45 + 9 stat-mech = 54 features) ─────────────────────
 FEATURE_COLUMNS = [
     # Sentiment (7)
     "overnight_sentiment_mean", "overnight_sentiment_max",
@@ -199,7 +218,7 @@ FEATURE_COLUMNS = [
     # Earnings (5)
     "eps_surprise_last", "revenue_surprise_last", "earnings_streak",
     "post_earnings_drift_1d", "earnings_volatility",
-]
+] + STAT_MECH_COLUMNS
 
 # ── Label Encoding ───────────────────────────────────────────────────────────
 LABEL_MAP = {-1: 0, 0: 1, 1: 2}

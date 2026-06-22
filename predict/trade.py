@@ -207,7 +207,7 @@ def log_trades(trades, label: str = "open"):
     with open(path, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
             "date", "time", "ticker", "direction", "qty", "entry_price",
-            "take_profit", "stop_loss", "p_spike", "p_dir", "order_id", "mode",
+            "take_profit", "stop_loss", "p_spike", "p_spike_raw", "p_dir", "order_id", "mode",
         ])
         if not file_exists:
             writer.writeheader()
@@ -220,7 +220,7 @@ def log_trades(trades, label: str = "open"):
 def generate_signals():
     """Run the spike detector model and return ranked trade signals."""
     from features import _download_safe, build_single_day_features, compute_macro_features
-    from features import impute_features_for_predict
+    from features import impute_features_for_predict, finalize_live_stat_mech
     from model import TwoStageModel
     from news import FinBERTScorer, FinnhubClient
 
@@ -260,6 +260,7 @@ def generate_signals():
         feature_rows[ticker] = row
         print("OK")
 
+    feature_rows = finalize_live_stat_mech(feature_rows)
     X = pd.DataFrame(feature_rows).T
     X.columns = FEATURE_COLUMNS
     X = impute_features_for_predict(X)
@@ -280,6 +281,7 @@ def generate_signals():
                 "ticker": ticker,
                 "direction": direction,
                 "p_spike": r["p_spike"],
+                "p_spike_raw": r.get("p_spike_raw", r["p_spike"]),
                 "p_dir": p_dir,
             })
 
@@ -463,6 +465,7 @@ def execute_trades(signals, client, dry_run=False):
             "take_profit": take_profit_price,
             "stop_loss": stop_loss_price,
             "p_spike": round(sig["p_spike"], 4),
+            "p_spike_raw": round(sig.get("p_spike_raw", sig["p_spike"]), 4),
             "p_dir": round(sig["p_dir"], 4),
             "order_id": order_id,
             "mode": "dry-run" if dry_run else ("paper" if client.paper else "live"),

@@ -52,7 +52,7 @@ def train_model(train_until):
     client = FinnhubClient()
     scorer = FinBERTScorer()
 
-    X, y, intraday_ret, _, adaptive_thresh = build_training_dataset(
+    X, y, intraday_ret, tickers, adaptive_thresh = build_training_dataset(
         UNIVERSE, client, scorer, end_date_str=train_until
     )
 
@@ -63,10 +63,15 @@ def train_model(train_until):
     ret_val = intraday_ret.iloc[len(X_train) :]
     thresh_train = adaptive_thresh.iloc[: len(X_train)]
     thresh_val = adaptive_thresh.iloc[len(X_train) :]
+    tickers_val = tickers.iloc[len(X_train) :]
 
     model = TwoStageModel()
     model.train(X_train, y_train, X_val, y_val, ret_train, ret_val,
                 thresh_train, thresh_val)
+
+    from stat_mech.ising import sign_returns_from_training
+    sign_returns = sign_returns_from_training(ret_train, tickers.iloc[:len(X_train)])
+    model.fit_stat_mech_layers(X_val, y_val, sign_returns, tickers_val=tickers_val)
 
     print("\n  Top 10 Spike Feature Importances:")
     importance = model.get_spike_feature_importance()
@@ -87,6 +92,7 @@ def predict_and_compare(model, test_start, test_end):
         _download_safe,
         build_single_day_features,
         compute_macro_features,
+        finalize_live_stat_mech,
     )
     from news import FinBERTScorer, FinnhubClient
 
@@ -125,6 +131,7 @@ def predict_and_compare(model, test_start, test_end):
             )
             feature_rows[ticker] = row
 
+        feature_rows = finalize_live_stat_mech(feature_rows)
         X_pred = pd.DataFrame(feature_rows).T
         X_pred.columns = FEATURE_COLUMNS
         X_pred = impute_features_for_predict(X_pred)
@@ -152,6 +159,7 @@ def predict_and_compare(model, test_start, test_end):
                     "date": date_str,
                     "ticker": ticker,
                     "p_spike": round(p["p_spike"], 3),
+                    "p_spike_raw": round(p.get("p_spike_raw", p["p_spike"]), 3),
                     "p_up": round(p["p_up"], 3),
                     "p_down": round(p["p_down"], 3),
                     "pred_class": pred_class,

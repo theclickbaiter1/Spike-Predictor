@@ -170,6 +170,18 @@ def backup_current_model():
         if src.exists():
             shutil.copy2(src, backup_dir / src.name)
 
+    base = Path(base)
+    for suffix in ["_calibrator.json", "_ising.json"]:
+        extra = base.parent / f"{base.name}{suffix}"
+        if extra.exists():
+            shutil.copy2(extra, backup_dir / extra.name)
+
+    beta_norm = Path(str(MODEL_PATH).replace("model.json", "beta_norm.json"))
+    if not beta_norm.exists():
+        beta_norm = Path(__file__).resolve().parent.parent / "data" / "beta_norm.json"
+    if beta_norm.exists():
+        shutil.copy2(beta_norm, backup_dir / "beta_norm.json")
+
     print(f"  📦 Current model backed up to {backup_dir}")
     return backup_dir
 
@@ -178,22 +190,29 @@ def restore_model_from_backup(backup_dir: Path):
     """Restore model files from a backup directory."""
     base = str(MODEL_PATH).replace(".json", "")
     model_name = Path(base).name
-    for suffix in ["_s1.json", "_s2.json", "_meta.json"]:
+    for suffix in ["_s1.json", "_s2.json", "_meta.json", "_calibrator.json", "_ising.json"]:
         src = backup_dir / f"{model_name}{suffix}"
         dest = Path(f"{base}{suffix}")
         if src.exists():
             shutil.copy2(src, dest)
+
+    beta_src = backup_dir / "beta_norm.json"
+    if beta_src.exists():
+        from config import DATA_DIR
+        shutil.copy2(beta_src, DATA_DIR / "beta_norm.json")
     print(f"  ↩️  Model restored from {backup_dir}")
 
 
-# Retrain acceptance: reject new model if val F1 drops more than this vs backup
+# Retrain acceptance: reject new model if val F1 or calibrated NLL worsens vs backup
 RETRAIN_MIN_F1_DELTA = -0.03
+RETRAIN_MAX_NLL_DELTA = 0.05  # reject if NLL increases by more than this
 
 
 def run_retrain(backup=True):
     from features import build_training_dataset
     from model import TwoStageModel, time_series_split
     from news import FinBERTScorer, FinnhubClient
+    from stat_mech.ising import sign_returns_from_training
 
     print_banner()
     print("  MODE: RETRAIN (2-stage model + adaptive threshold)\n")
@@ -206,11 +225,12 @@ def run_retrain(backup=True):
     client = FinnhubClient()
     scorer = FinBERTScorer()
 
-    X, y, intraday_ret, _, adaptive_thresh = build_training_dataset(UNIVERSE, client, scorer)
+    X, y, intraday_ret, tickers, adaptive_thresh = build_training_dataset(UNIVERSE, client, scorer)
 
     training_df = X.copy()
     training_df["_target"] = y
     training_df["_intraday_return"] = intraday_ret
+    training_df["_ticker"] = tickers.values
     training_df.to_parquet(TRAINING_DATA_PATH)
     print(f"\n  Training data saved to {TRAINING_DATA_PATH}")
 
@@ -225,13 +245,17 @@ def run_retrain(backup=True):
 
     # Evaluate previous model on same val split (acceptance gate)
     old_metrics = None
+    old_nll = None
     if backup_dir is not None:
         old_model = TwoStageModel()
         try:
             old_model.load()
             old_metrics = old_model.spike_val_metrics(X_val, y_val)
+            old_nll = old_model.calibrated_val_nll(X_val, y_val)
             print(f"\n  Previous model val F1: {old_metrics['f1']:.3f} "
                   f"(prec {old_metrics['precision']:.3f}, rec {old_metrics['recall']:.3f})")
+            if old_nll < float("inf"):
+                print(f"  Previous model val NLL: {old_nll:.4f}")
         except Exception as e:
             print(f"\n  ⚠ Could not load previous model for comparison: {e}")
 
@@ -239,15 +263,29 @@ def run_retrain(backup=True):
     model.train(X_train, y_train, X_val, y_val, ret_train, ret_val,
                 thresh_train, thresh_val)
 
+    sign_returns = sign_returns_from_training(ret_train, tickers.iloc[:len(X_train)])
+    model.fit_stat_mech_layers(X_val, y_val, sign_returns, tickers_val=tickers.iloc[len(X_train):])
+
     new_metrics = model.spike_val_metrics(X_val, y_val)
+    new_nll = model.calibrated_val_nll(X_val, y_val)
     print(f"\n  New model val F1: {new_metrics['f1']:.3f} "
           f"(prec {new_metrics['precision']:.3f}, rec {new_metrics['recall']:.3f})")
+    print(f"  New model val NLL: {new_nll:.4f}")
 
     if old_metrics is not None:
         f1_delta = new_metrics["f1"] - old_metrics["f1"]
+        reject = False
         if f1_delta < RETRAIN_MIN_F1_DELTA:
             print(f"\n  🛑 RETRAIN REJECTED — val F1 dropped {f1_delta:+.3f} "
-                  f"(threshold {RETRAIN_MIN_F1_DELTA:+.3f}). Restoring backup.")
+                  f"(threshold {RETRAIN_MIN_F1_DELTA:+.3f}).")
+            reject = True
+        if old_nll is not None and old_nll < float("inf") and new_nll < float("inf"):
+            nll_delta = new_nll - old_nll
+            if nll_delta > RETRAIN_MAX_NLL_DELTA:
+                print(f"  🛑 RETRAIN REJECTED — val NLL increased {nll_delta:+.4f} "
+                      f"(threshold {RETRAIN_MAX_NLL_DELTA:+.4f}).")
+                reject = True
+        if reject:
             restore_model_from_backup(backup_dir)
             sys.exit(1)
         print(f"  ✅ Acceptance gate passed (F1 delta {f1_delta:+.3f})")
@@ -268,7 +306,7 @@ def run_retrain(backup=True):
 def run_predict():
     from features import (
         build_single_day_features, _download_safe, compute_macro_features,
-        impute_features_for_predict,
+        impute_features_for_predict, finalize_live_stat_mech,
     )
     from model import TwoStageModel
     from news import FinBERTScorer, FinnhubClient
@@ -316,6 +354,7 @@ def run_predict():
         feature_rows[ticker] = row
         print("OK")
 
+    feature_rows = finalize_live_stat_mech(feature_rows)
     X = pd.DataFrame(feature_rows).T
     X.columns = FEATURE_COLUMNS
     valid_tickers = list(impute_features_for_predict(X).index)
@@ -332,6 +371,7 @@ def run_predict():
         results.append({
             "ticker": ticker,
             "p_spike": r["p_spike"],
+            "p_spike_raw": r.get("p_spike_raw", r["p_spike"]),
             "p_up": r["p_up"],
             "p_down": r["p_down"],
             "p_flat": r["p_flat"],
@@ -341,7 +381,7 @@ def run_predict():
     if not results:
         print("\n  📭 No valid predictions (missing market data). Saving empty watchlist.")
         results_df = pd.DataFrame(columns=[
-            "ticker", "p_spike", "p_up", "p_down", "p_flat", "top_signal",
+            "ticker", "p_spike", "p_spike_raw", "p_up", "p_down", "p_flat", "top_signal",
         ])
     else:
         results_df = pd.DataFrame(results).sort_values("p_spike", ascending=False)

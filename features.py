@@ -7,6 +7,7 @@ Improvements:
   C. All features use ONLY data available before market open.
 """
 
+import json
 import warnings
 from datetime import datetime, timedelta
 
@@ -16,6 +17,7 @@ import yfinance as yf
 
 from config import (
     ADAPTIVE_MULTIPLIER,
+    DATA_DIR,
     EARNINGS_CACHE_DIR,
     FEATURE_COLUMNS,
     FINNHUB_API_KEY,
@@ -23,6 +25,13 @@ from config import (
     SECTOR_MAP,
     SPIKE_THRESHOLD,
     TRAINING_LOOKBACK_YEARS,
+)
+from stat_mech_features import (
+    attach_live_stat_mech,
+    build_live_cross_section_cache,
+    compute_beta_norm_params,
+    enrich_training_frame,
+    sentiment_entropy_from_scores,
 )
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -76,6 +85,7 @@ OPTIONAL_FILL_COLS = [
     "vix_change_3d", "vix_change_5d", "vix_regime",
     "dxy_change_5d", "crude_oil_change_5d", "gold_change_5d",
     "treasury_10y_delta_5d", "sp500_return_3d",
+    "susceptibility_proxy", "criticality_proxy",
 ]
 
 
@@ -565,12 +575,15 @@ def build_training_dataset(
             headline_scores = dict(zip(unique_headlines, scores))
 
         sent_rows = []
+        sent_entropy_rows = []
         for date in ohlcv.index:
             overnight = filter_articles_for_date(all_articles, date)
             day_hl = [a.get("headline", "").strip() for a in overnight if a.get("headline", "").strip()]
             day_sc = [headline_scores[h] for h in day_hl if h in headline_scores]
             sent_rows.append(compute_sentiment_from_scores(day_sc))
+            sent_entropy_rows.append(sentiment_entropy_from_scores(day_sc))
         sent_df = pd.DataFrame(sent_rows, index=ohlcv.index)
+        sent_df["sentiment_entropy"] = sent_entropy_rows
         # Relative news volume: z-score vs ticker's own 60-day baseline
         nc = sent_df["overnight_news_count"]
         nc_mean = nc.rolling(60, min_periods=10).mean().shift(1)
@@ -619,8 +632,16 @@ def build_training_dataset(
 
     combined = pd.concat(all_rows, axis=0)
 
-    # Step 4: Clean up
-    print(f"\n  [4/4] Finalizing dataset...")
+    # Stat-mech features (cross-section + sector coupling)
+    print("  [4/5] Computing statistical mechanics features...")
+    beta_mean, beta_std = compute_beta_norm_params(combined)
+    combined = enrich_training_frame(combined, beta_mean, beta_std)
+    beta_norm_path = DATA_DIR / "beta_norm.json"
+    with open(beta_norm_path, "w") as f:
+        json.dump({"mean": beta_mean, "std": beta_std}, f)
+
+    # Step 5: Clean up
+    print(f"\n  [5/5] Finalizing dataset...")
     y_raw = combined["_target"]
     intraday_ret = combined["_intraday_return"]
     adaptive_thresh = combined["_adaptive_threshold"]
@@ -674,7 +695,8 @@ def fetch_adaptive_threshold(ticker: str, date_str: str) -> float:
 
 def build_single_day_features(
     ticker: str, date: datetime, news_client, sentiment_scorer,
-    ohlcv_cache=None, macro_cache=None,
+    ohlcv_cache=None, macro_cache=None, cross_section_cache=None,
+    beta_mean: float = 0.0, beta_std: float = 1.0,
 ) -> pd.Series:
     """Build one feature row for a ticker on a given date (live prediction)."""
     from news import compute_sentiment_features
@@ -758,4 +780,47 @@ def build_single_day_features(
         for col in earnings_feats.columns:
             row[col] = earnings_feats.loc[last_idx, col]
 
+    if cross_section_cache is not None:
+        attach_live_stat_mech(row, ticker, cross_section_cache, beta_mean, beta_std)
+    else:
+        for col in [
+            "sector_magnetization", "sector_abs_magnetization", "local_field",
+            "coupling_alignment", "cross_section_entropy", "sentiment_entropy",
+            "inverse_temperature", "susceptibility_proxy", "criticality_proxy",
+        ]:
+            row[col] = np.nan
+
     return pd.Series({col: row.get(col, np.nan) for col in FEATURE_COLUMNS})
+
+
+def load_beta_norm() -> tuple[float, float]:
+    """Load train-set inverse_temperature normalization from disk."""
+    path = DATA_DIR / "beta_norm.json"
+    if not path.exists():
+        return 0.0, 1.0
+    with open(path) as f:
+        data = json.load(f)
+    return float(data.get("mean", 0.0)), float(data.get("std", 1.0))
+
+
+def finalize_live_stat_mech(feature_rows: dict[str, pd.Series]) -> dict[str, pd.Series]:
+    """Second pass: attach cross-section stat-mech features for live prediction."""
+    beta_mean, beta_std = load_beta_norm()
+    gaps = {
+        t: float(r.get("overnight_gap", 0) or 0)
+        for t, r in feature_rows.items()
+        if pd.notna(r.get("overnight_gap"))
+    }
+    sent_scores = {}
+    for t, r in feature_rows.items():
+        sent = r.get("overnight_sentiment_mean", 0)
+        if pd.notna(sent) and sent != 0:
+            sent_scores[t] = [float(sent)]
+    cache = build_live_cross_section_cache(gaps, sent_scores or None)
+
+    out = {}
+    for ticker, row in feature_rows.items():
+        row_dict = row.to_dict()
+        attach_live_stat_mech(row_dict, ticker, cache, beta_mean, beta_std)
+        out[ticker] = pd.Series({col: row_dict.get(col, np.nan) for col in FEATURE_COLUMNS})
+    return out

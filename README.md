@@ -1,6 +1,6 @@
 # Pre-Market Spike Detector v2
 
-A fully automated Python pipeline that predicts intraday stock spikes before market open and executes paper trades through Alpaca. Built around a two-stage XGBoost model with FinBERT sentiment, adaptive per-ticker thresholds, and 45 features spanning sentiment, technical, macro, earnings, and calendar signals. The full daily loop — predict, alert, trade, validate, retrain — runs on its own with no human in the loop.
+A fully automated Python pipeline that predicts intraday stock spikes before market open and executes paper trades through Alpaca. Built around a two-stage XGBoost backbone with a statistical-mechanics inference layer (entropy, sector magnetization, Boltzmann calibration, Ising overlay), FinBERT sentiment, adaptive per-ticker thresholds, and 54 features spanning sentiment, technical, macro, earnings, calendar, and stat-mech signals. The full daily loop — predict, alert, trade, validate, retrain — runs on its own with no human in the loop.
 
 **Last updated:** May 26, 2026 (added A/B timing experiment via dual paper accounts; fixed Alpaca data-API URL bug; added Telegram /start subscriber broadcast)
 
@@ -110,7 +110,11 @@ flowchart TB
 .
 ├── config.py                  # Universe, feature columns, XGBoost params, risk limits, API URLs
 ├── features.py                # Feature engineering (technical, macro, sentiment, earnings, calendar)
-├── model.py                   # Two-stage XGBoost model + time-series split + retrain
+├── model.py                   # Two-stage XGBoost + Boltzmann calibrator + Ising overlay
+├── stat_mech_features.py      # Entropy, magnetization, β(VIX) feature engineering
+├── stat_mech/
+│   ├── calibrator.py          # BoltzmannCalibrator (3-state Gibbs / MaxEnt)
+│   └── ising.py               # Sector Ising mean-field overlay + λ blend
 ├── news.py                    # Finnhub client + FinBERT scorer (disk-cached)
 ├── predict/
 │   ├── spike_detector.py      # Main pipeline — predict + --retrain modes
@@ -127,7 +131,8 @@ flowchart TB
 │   ├── backtest_strategy.py   # Strategy backtest with TP/SL
 │   ├── daily_validation.py    # Lightweight daily pred-vs-actual + rolling metrics
 │   ├── validate_today.py      # Full retrain-and-validate for a single date (heavy)
-│   └── validate_week.py       # Full retrain-and-validate for a date range (heavy)
+│   ├── validate_week.py       # Full retrain-and-validate for a date range (heavy)
+│   └── compare_calibrators.py # Raw vs calibrated NLL, Brier, reliability diagram
 ├── data/                      # gitignored — cached news, earnings, OHLCV, model, subscribers.json
 ├── output/                    # gitignored — daily watchlists, per-account trade logs, validation_state/
 ├── pyrefly.toml               # Points Pyrefly at venv/bin/python (IDE diagnostics)
@@ -224,11 +229,23 @@ Predicts `P(up | spike)` — if a spike happens, which way. Trained on **spike +
 ### Inference
 
 ```
-p_spike = Stage1.predict_proba(X)
-p_up    = p_spike * Stage2.predict_proba(X)
-p_down  = p_spike * (1 - Stage2.predict_proba(X))
-p_flat  = 1 - p_spike
+p_spike_raw = Stage1.predict_proba(X)
+p_up_raw    = p_spike_raw * Stage2.predict_proba(X)
 ```
+
+Raw factorized probabilities are then passed through the **stat-mech inference layer** (see below) to produce calibrated `p_spike`, `p_up`, `p_down`, `p_flat`. Trade logs record both `p_spike_raw` and `p_spike` for A/B calibration analysis.
+
+### Statistical mechanics hybrid layer
+
+XGBoost remains the backbone learner. Three stat-mech components sit on top:
+
+1. **Feature engineering** (`stat_mech_features.py`) — sector magnetization, Shannon entropy of overnight gaps and headline scores, inverse temperature β(VIX), susceptibility/criticality proxies.
+2. **Boltzmann calibrator** (`stat_mech/calibrator.py`) — fits a 3-state Gibbs distribution on validation data, mapping XGBoost logits + local field/coupling features to a thermodynamically consistent joint law over {up, flat, down}.
+3. **Sector Ising overlay** (`stat_mech/ising.py`) — mean-field solve on same-sector couplings; blends with calibrated XGBoost via tunable λ (default 0.85, favoring XGBoost).
+
+Retrain acceptance gate rejects deploy if val F1 drops >0.03 **or** calibrated NLL worsens by >0.05 vs the backup model.
+
+Offline calibration benchmarks: `python backtest/compare_calibrators.py` (NLL, Brier, reliability diagram → `output/reliability_diagram.png`).
 
 ### Adaptive spike threshold
 
@@ -240,7 +257,7 @@ threshold = max(20-day avg |intraday return| * 1.5, 3%)
 
 NVDA's threshold might be 5%, while AAPL's might be 3%. This prevents volatile stocks from being labeled as "spiking" every day just because they always move.
 
-## Features (45 total)
+## Features (54 total)
 
 ### Sentiment (7)
 Overnight news headlines scored with [ProsusAI/FinBERT](https://huggingface.co/ProsusAI/finbert). Mean, max, min, std of sentiment scores, raw news count, z-scored news volume (abnormal-attention signal), and a binary news-spike flag (≥3× normal overnight volume).
@@ -256,6 +273,9 @@ Day of week, Monday/Friday flags, days to next earnings, earnings day flag.
 
 ### Earnings (5)
 Most recent EPS surprise %, revenue surprise %, consecutive beat/miss streak, post-earnings 1-day drift, average absolute return on earnings days (last 4 quarters).
+
+### Statistical mechanics (9)
+`sector_magnetization`, `sector_abs_magnetization`, `local_field` (macro + sentiment external field), `coupling_alignment` (σᵢ · m_sector), `cross_section_entropy` (market-wide disorder), `sentiment_entropy` (FinBERT score histogram entropy), `inverse_temperature` β(VIX) z-scored, `susceptibility_proxy` (20d std of sector magnetization), `criticality_proxy` (susceptibility × cross-section entropy). Stage 1 excludes `inverse_temperature` to avoid double-counting with the Boltzmann layer.
 
 ### Planned (not yet implemented)
 - Live pre-market price/volume features (requires paid Alpaca data tier)
