@@ -14,6 +14,7 @@ import argparse
 import shutil
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -25,10 +26,11 @@ from config import (
 )
 
 MIN_TRAINING_TICKERS = 50
+ET = ZoneInfo("America/New_York")
 
 
 def print_banner():
-    now = datetime.now()
+    now = datetime.now(ET)
     print()
     print("═" * 65)
     print(f"  SPIKE DETECTOR v2 — {now.strftime('%Y-%m-%d %I:%M %p ET')}")
@@ -451,7 +453,7 @@ def run_predict():
     client = FinnhubClient()
     scorer = FinBERTScorer()
 
-    today = datetime.now()
+    today = datetime.now(ET)
     end_str = today.strftime("%Y-%m-%d")
     start_str = (today - timedelta(days=60)).strftime("%Y-%m-%d")
 

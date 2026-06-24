@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import argparse
 import json
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -36,6 +37,7 @@ from config import (
 )
 
 SUBSCRIBERS_PATH = DATA_DIR / "subscribers.json"
+ET = ZoneInfo("America/New_York")
 
 
 # ── Subscriber persistence ───────────────────────────────────────────────────
@@ -178,7 +180,7 @@ def format_watchlist(csv_path: str) -> str:
     import pandas as pd
 
     df = pd.read_csv(csv_path)
-    date_str = datetime.now().strftime("%Y-%m-%d")
+    date_str = datetime.now(ET).strftime("%Y-%m-%d")
     pcol = "p_spike_trade" if "p_spike_trade" in df.columns else "p_spike"
     trade_thresh = get_trade_threshold()
 
@@ -236,7 +238,7 @@ def format_trade_summary(csv_path: str = None, label: str = "open") -> str:
         return f"*Spike Trader [{tag}]* — No trades recorded."
 
     # Filter to today's trades
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(ET).strftime("%Y-%m-%d")
     df_today = df[df["date"] == today]
 
     if df_today.empty:
@@ -308,7 +310,7 @@ def format_eod_close_summary() -> str:
     """Format EOD position close logs for both accounts."""
     import json
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = datetime.now(ET).strftime("%Y-%m-%d")
     lines = [f"*EOD Close — {today}*\n"]
 
     for label in ("open", "delayed"):
@@ -421,7 +423,7 @@ def main():
     if args.file:
         csv_path = args.file
     else:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = datetime.now(ET).strftime("%Y-%m-%d")
         csv_path = OUTPUT_DIR / f"watchlist_{date_str}.csv"
 
     if not Path(csv_path).exists():

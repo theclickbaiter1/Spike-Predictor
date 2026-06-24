@@ -94,8 +94,17 @@ jobs:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY_DELAYED }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY_DELAYED }}
         run: |
-          python predict/trade.py --paper --label delayed \
-            --watchlist "output/watchlist_${{ steps.et_date.outputs.today }}.csv"
+          WATCHLIST="output/watchlist_${{ steps.et_date.outputs.today }}.csv"
+          if [ ! -f "$WATCHLIST" ]; then
+            WATCHLIST=$(ls -1 output/watchlist_*.csv 2>/dev/null | head -1)
+          fi
+          if [ -z "$WATCHLIST" ] || [ ! -f "$WATCHLIST" ]; then
+            echo "::error::No watchlist CSV found in output/"
+            ls -la output/ || true
+            exit 1
+          fi
+          echo "Using watchlist: $WATCHLIST"
+          python predict/trade.py --paper --label delayed --watchlist "$WATCHLIST"
 
       - name: Send trade confirmations to Telegram
         env:
