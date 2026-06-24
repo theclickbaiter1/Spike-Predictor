@@ -19,7 +19,8 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 
 from config import (
     FEATURE_COLUMNS, MODEL_PATH, SPIKE_THRESHOLD, UNIVERSE,
-    VAL_FRACTION, XGB_PARAMS_S1, XGB_PARAMS_S2, get_trade_threshold,
+    VAL_FRACTION, XGB_PARAMS_S1, XGB_PARAMS_S2,
+    S1_POS_WEIGHT_MULTIPLIER, get_trade_threshold,
 )
 from stat_mech.calibrator import BoltzmannCalibrator
 from stat_mech.guards import detect_calibrator_degeneracy
@@ -29,6 +30,18 @@ from stat_mech.ising import IsingOverlay
 # (β(VIX) is used downstream in the Boltzmann calibrator).
 _S1_EXCLUDE = {"realized_vol_20d", "inverse_temperature"}
 S1_FEATURE_COLUMNS = [c for c in FEATURE_COLUMNS if c not in _S1_EXCLUDE]
+
+
+def _align_to_model_features(X: pd.DataFrame, model: xgb.XGBClassifier) -> pd.DataFrame:
+    """Subset/reorder columns to match a saved XGBoost model (handles feature migrations)."""
+    feat_names = model.get_booster().feature_names
+    if not feat_names:
+        return X
+    aligned = X.copy()
+    for col in feat_names:
+        if col not in aligned.columns:
+            aligned[col] = 0.0
+    return aligned[list(feat_names)]
 
 
 def time_series_split(X, y, val_frac=VAL_FRACTION):
@@ -87,7 +100,7 @@ class TwoStageModel:
         es = params.pop("early_stopping_rounds", 50)
         n_flat = (y_s1_train == 0).sum()
         n_spike = (y_s1_train == 1).sum()
-        params["scale_pos_weight"] = n_flat / max(n_spike, 1)
+        params["scale_pos_weight"] = (n_flat / max(n_spike, 1)) * S1_POS_WEIGHT_MULTIPLIER
 
         self.spike_model = xgb.XGBClassifier(**params, early_stopping_rounds=es)
         self.spike_model.fit(
@@ -185,7 +198,7 @@ class TwoStageModel:
         params = XGB_PARAMS_S1.copy()
         params.pop("early_stopping_rounds", None)
         params["n_estimators"] = self.best_rounds_s1
-        params["scale_pos_weight"] = n_flat / max(n_spike, 1)
+        params["scale_pos_weight"] = (n_flat / max(n_spike, 1)) * S1_POS_WEIGHT_MULTIPLIER
         self.spike_model = xgb.XGBClassifier(**params)
         self.spike_model.fit(X[S1_FEATURE_COLUMNS], y_s1, verbose=False)
 
@@ -213,7 +226,7 @@ class TwoStageModel:
             probs = self.predict(X_val)
             p_spike = probs["p_spike"].values
         else:
-            X_s1 = X_val[S1_FEATURE_COLUMNS]
+            X_s1 = _align_to_model_features(X_val, self.spike_model)
             p_spike = self.spike_model.predict_proba(X_s1)[:, 1]
         y_true = (y_val != 1).astype(int)
         y_pred = (p_spike >= threshold).astype(int)
@@ -232,11 +245,15 @@ class TwoStageModel:
 
     def predict_raw(self, X):
         """Raw factorized XGBoost probabilities (no stat-mech layers)."""
-        X_s1 = X[S1_FEATURE_COLUMNS] if isinstance(X, pd.DataFrame) else X
+        if isinstance(X, pd.DataFrame):
+            X_s1 = _align_to_model_features(X, self.spike_model)
+            X_s2 = _align_to_model_features(X, self.direction_model) if self.direction_model else X
+        else:
+            X_s1, X_s2 = X, X
         p_spike = self.spike_model.predict_proba(X_s1)[:, 1]
 
         if self.direction_model is not None:
-            p_up_given_spike = self.direction_model.predict_proba(X)[:, 1]
+            p_up_given_spike = self.direction_model.predict_proba(X_s2)[:, 1]
         else:
             p_up_given_spike = np.full(len(X), 0.5)
 
@@ -350,4 +367,5 @@ class TwoStageModel:
 
     def get_spike_feature_importance(self):
         imp = self.spike_model.feature_importances_
-        return pd.Series(imp, index=S1_FEATURE_COLUMNS).sort_values(ascending=False)
+        names = self.spike_model.get_booster().feature_names or S1_FEATURE_COLUMNS
+        return pd.Series(imp, index=names).sort_values(ascending=False)

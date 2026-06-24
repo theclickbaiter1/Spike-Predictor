@@ -17,6 +17,8 @@ import yfinance as yf
 
 from config import (
     ADAPTIVE_MULTIPLIER,
+    ALPACA_API_KEY,
+    ALPACA_SECRET_KEY,
     DATA_DIR,
     EARNINGS_CACHE_DIR,
     FEATURE_COLUMNS,
@@ -82,6 +84,8 @@ def classify_intraday_return(ret: float, threshold: float = None) -> str:
 OPTIONAL_FILL_COLS = [
     "eps_surprise_last", "revenue_surprise_last", "earnings_streak",
     "post_earnings_drift_1d", "earnings_volatility",
+    "premarket_gap_pct", "premarket_volume_ratio", "gap_sentiment_agreement",
+    "earnings_catalyst_score",
     "vix_change_3d", "vix_change_5d", "vix_regime",
     "dxy_change_5d", "crude_oil_change_5d", "gold_change_5d",
     "treasury_10y_delta_5d", "sp500_return_3d",
@@ -96,6 +100,9 @@ def impute_features_for_predict(X: pd.DataFrame) -> pd.DataFrame:
     If macro edge-cases would drop every ticker, fall back to 0-fill with a warning.
     """
     X = X.copy()
+    for col in FEATURE_COLUMNS:
+        if col not in X.columns:
+            X[col] = 0.0
     for col in OPTIONAL_FILL_COLS:
         if col in X.columns:
             X[col] = X[col].fillna(0)
@@ -151,23 +158,124 @@ def compute_technical_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     return f
 
 
-# ── Macro / Market Context ───────────────────────────────────────────────────
+def compute_catalyst_features(
+    ohlcv: pd.DataFrame,
+    sentiment_mean: pd.Series | None = None,
+    earnings_catalyst: pd.Series | None = None,
+) -> pd.DataFrame:
+    """
+    Catalyst confirmation features (no lookahead).
+    Training uses open-gap proxy for premarket_gap when intraday pre-market unavailable.
+    """
+    close = ohlcv["Close"]
+    open_ = ohlcv["Open"]
+    volume = ohlcv["Volume"]
+    f = pd.DataFrame(index=ohlcv.index)
+    prev_close = close.shift(1)
+    f["premarket_gap_pct"] = (open_ - prev_close) / prev_close.replace(0, np.nan)
+    avg_vol = volume.rolling(10, min_periods=5).mean().shift(1)
+    f["premarket_volume_ratio"] = (volume.shift(1) / avg_vol.replace(0, np.nan)).fillna(0)
 
-def _download_safe(ticker: str, start: str, end: str) -> pd.DataFrame:
+    if sentiment_mean is not None:
+        sent = sentiment_mean.reindex(ohlcv.index).fillna(0)
+        gap = f["premarket_gap_pct"].fillna(0)
+        agree = (
+            (gap.abs() > 0.002)
+            & (sent.abs() > 0.1)
+            & (np.sign(gap) == np.sign(sent))
+        ).astype(int)
+        f["gap_sentiment_agreement"] = agree
+    else:
+        f["gap_sentiment_agreement"] = 0
+
+    if earnings_catalyst is not None:
+        f["earnings_catalyst_score"] = earnings_catalyst.reindex(ohlcv.index).fillna(0)
+    else:
+        f["earnings_catalyst_score"] = 0.0
+
+    return f
+
+
+def fetch_live_premarket_price(ticker: str) -> float | None:
+    """Fetch latest trade price from Alpaca data API (pre-market). Returns None if unavailable."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return None
     try:
-        data = yf.download(ticker, start=start, end=end, progress=False)
-        if isinstance(data.columns, pd.MultiIndex):
-            data.columns = data.columns.droplevel(1)
-        if data.empty:
-            # yfinance occasionally fails on specific start dates — nudge by 1 day
-            alt_start = (pd.Timestamp(start) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            data = yf.download(ticker, start=alt_start, end=end, progress=False)
+        import requests
+        url = f"https://data.alpaca.markets/v2/stocks/{ticker}/trades/latest"
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        }
+        resp = requests.get(url, headers=headers, timeout=8)
+        if resp.ok:
+            trade = resp.json().get("trade", {})
+            return float(trade.get("p", 0)) or None
+    except Exception:
+        pass
+    return None
+
+
+def apply_live_premarket_overrides(row: dict, ticker: str, ohlcv: pd.DataFrame) -> dict:
+    """Override premarket_gap_pct with live price when available before the open."""
+    if ohlcv.empty:
+        return row
+    prev_close = float(ohlcv["Close"].iloc[-2]) if len(ohlcv) >= 2 else float(ohlcv["Close"].iloc[-1])
+    live_px = fetch_live_premarket_price(ticker)
+    if live_px and prev_close > 0:
+        row["premarket_gap_pct"] = (live_px - prev_close) / prev_close
+        sent = row.get("overnight_sentiment_mean", 0) or 0
+        gap = row["premarket_gap_pct"]
+        if abs(gap) > 0.002 and abs(sent) > 0.1 and np.sign(gap) == np.sign(sent):
+            row["gap_sentiment_agreement"] = 1
+        else:
+            row["gap_sentiment_agreement"] = 0
+    return row
+
+
+def _download_safe(ticker: str, start: str, end: str, retries: int = 3) -> pd.DataFrame:
+    """
+    Download OHLCV with retries. yfinance bulk threads often rate-limit mid-run;
+    we use threads=False and fall back to Ticker.history().
+    """
+    import time
+
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    if end_ts <= start_ts:
+        end_ts = start_ts + pd.Timedelta(days=1)
+
+    for attempt in range(retries):
+        try:
+            data = yf.download(
+                ticker,
+                start=start_ts.strftime("%Y-%m-%d"),
+                end=end_ts.strftime("%Y-%m-%d"),
+                progress=False,
+                threads=False,
+                auto_adjust=True,
+            )
             if isinstance(data.columns, pd.MultiIndex):
                 data.columns = data.columns.droplevel(1)
-        return data
-    except Exception as e:
-        print(f"  ⚠ yfinance download failed for {ticker}: {e}")
-        return pd.DataFrame()
+            if not data.empty and len(data) >= 5:
+                return data
+
+            # Fallback: Ticker.history (often succeeds when download() fails)
+            hist = yf.Ticker(ticker).history(
+                start=start_ts.strftime("%Y-%m-%d"),
+                end=end_ts.strftime("%Y-%m-%d"),
+                auto_adjust=True,
+            )
+            if isinstance(hist.columns, pd.MultiIndex):
+                hist.columns = hist.columns.droplevel(1)
+            if not hist.empty:
+                return hist
+        except Exception as e:
+            if attempt == retries - 1:
+                print(f"  ⚠ yfinance download failed for {ticker}: {e}")
+        time.sleep(0.35 * (attempt + 1))
+
+    return pd.DataFrame()
 
 
 def compute_macro_features(trading_dates, start_date, end_date):
@@ -325,6 +433,41 @@ def compute_calendar_features(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFr
 
 # ── Earnings Features ────────────────────────────────────────────────────────
 
+def _normalize_earnings_records(records: list[dict]) -> list[dict]:
+    """Sort by date and backfill missing revenue estimates from prior quarters."""
+    if not records:
+        return records
+
+    parsed = []
+    for rec in records:
+        try:
+            parsed.append({
+                "date": str(pd.Timestamp(rec["date"]).normalize().date()),
+                "epsActual": rec.get("epsActual", np.nan),
+                "epsEstimate": rec.get("epsEstimate", np.nan),
+                "revenueActual": rec.get("revenueActual", np.nan),
+                "revenueEstimate": rec.get("revenueEstimate", np.nan),
+            })
+        except Exception:
+            continue
+
+    parsed.sort(key=lambda x: x["date"])
+    for i, rec in enumerate(parsed):
+        est = rec.get("revenueEstimate")
+        if pd.notna(est) and est != 0:
+            continue
+        prior = [
+            p["revenueActual"] for p in parsed[:i]
+            if pd.notna(p.get("revenueActual")) and p.get("revenueActual", 0) != 0
+        ]
+        if len(prior) >= 4:
+            rec["revenueEstimate"] = prior[-4]
+        elif prior:
+            rec["revenueEstimate"] = prior[-1]
+
+    return parsed
+
+
 def _fetch_earnings_data(ticker: str) -> list[dict]:
     """
     Fetch earnings history for a ticker via yfinance. Returns a list of dicts
@@ -336,11 +479,41 @@ def _fetch_earnings_data(ticker: str) -> list[dict]:
     cache_path = EARNINGS_CACHE_DIR / f"{ticker}_earnings.json"
     if cache_path.exists():
         with open(cache_path, "r") as f:
-            return json.load(f)
+            cached = json.load(f)
+        if cached:
+            normalized = _normalize_earnings_records(cached)
+            has_surprise_inputs = any(
+                pd.notna(r.get("revenueActual")) and r.get("revenueActual", 0) != 0
+                and pd.notna(r.get("revenueEstimate")) and r.get("revenueEstimate", 0) != 0
+                for r in normalized
+            )
+            if has_surprise_inputs:
+                return normalized
 
     records = []
     try:
         t = yf.Ticker(ticker)
+
+        # Finnhub earnings (has revenue actual/estimate when available)
+        if FINNHUB_API_KEY:
+            try:
+                import requests
+                resp = requests.get(
+                    "https://finnhub.io/api/v1/stock/earnings",
+                    params={"symbol": ticker, "token": FINNHUB_API_KEY},
+                    timeout=10,
+                )
+                if resp.ok:
+                    for item in resp.json():
+                        records.append({
+                            "date": str(pd.Timestamp(item.get("period", item.get("date", ""))).normalize().date()),
+                            "epsActual": float(item.get("actual", np.nan)) if item.get("actual") is not None else np.nan,
+                            "epsEstimate": float(item.get("estimate", np.nan)) if item.get("estimate") is not None else np.nan,
+                            "revenueActual": float(item.get("revenueActual", np.nan)) if item.get("revenueActual") is not None else np.nan,
+                            "revenueEstimate": float(item.get("revenueEstimate", np.nan)) if item.get("revenueEstimate") is not None else np.nan,
+                        })
+            except Exception:
+                pass
 
         # Try earnings_history (preferred — has EPS surprise data)
         eh = getattr(t, "earnings_history", None)
@@ -354,24 +527,26 @@ def _fetch_earnings_data(ticker: str) -> list[dict]:
                     "revenueEstimate": np.nan,
                 }
                 records.append(rec)
-        else:
+        elif not records:
             # Fallback: use earnings_dates which has Reported/Estimate EPS
             ed = getattr(t, "earnings_dates", None)
             if ed is not None and isinstance(ed, pd.DataFrame) and not ed.empty:
                 for idx, row in ed.iterrows():
                     reported = row.get("Reported EPS", np.nan)
                     estimate = row.get("EPS Estimate", np.nan)
+                    rev_actual = row.get("Reported Revenue", row.get("Revenue", np.nan))
+                    rev_est = row.get("Revenue Estimate", np.nan)
                     if pd.notna(reported):  # Only include quarters with actual results
                         rec = {
                             "date": str(pd.Timestamp(idx).normalize().date()),
                             "epsActual": float(reported),
                             "epsEstimate": float(estimate) if pd.notna(estimate) else np.nan,
-                            "revenueActual": np.nan,
-                            "revenueEstimate": np.nan,
+                            "revenueActual": float(rev_actual) if pd.notna(rev_actual) else np.nan,
+                            "revenueEstimate": float(rev_est) if pd.notna(rev_est) else np.nan,
                         }
                         records.append(rec)
 
-        # Try to get revenue data from quarterly_financials
+        # Try to get revenue data from quarterly_financials + income statement
         qf = getattr(t, "quarterly_financials", None)
         if qf is not None and isinstance(qf, pd.DataFrame) and not qf.empty:
             rev_row = None
@@ -381,18 +556,64 @@ def _fetch_earnings_data(ticker: str) -> list[dict]:
                     break
             if rev_row is not None:
                 for rec in records:
+                    if pd.notna(rec.get("revenueActual")):
+                        continue
                     rec_date = pd.Timestamp(rec["date"])
-                    # Match by nearest quarter end
                     for col_date in rev_row.index:
                         if abs((pd.Timestamp(col_date) - rec_date).days) < 45:
                             rec["revenueActual"] = float(rev_row[col_date]) if pd.notna(rev_row[col_date]) else np.nan
                             break
 
+        # Revenue from income statement (yfinance) — map quarters to earnings dates
+        for stmt_attr in ("quarterly_income_stmt", "quarterly_financials"):
+            stmt = getattr(t, stmt_attr, None)
+            if stmt is None or not isinstance(stmt, pd.DataFrame) or stmt.empty:
+                continue
+            rev_row = None
+            for label in ["Total Revenue", "Revenue", "Net Revenue"]:
+                if label in stmt.index:
+                    rev_row = stmt.loc[label]
+                    break
+            if rev_row is None:
+                continue
+            sorted_cols = sorted(rev_row.index, key=lambda x: pd.Timestamp(x))
+            rev_by_date = {pd.Timestamp(c): float(rev_row[c]) for c in sorted_cols if pd.notna(rev_row[c])}
+            for rec in records:
+                if pd.notna(rec.get("revenueActual")) and rec.get("revenueActual", 0) != 0:
+                    continue
+                rec_date = pd.Timestamp(rec["date"])
+                best_col, best_diff = None, 999
+                for col_date, val in rev_by_date.items():
+                    diff = abs((col_date - rec_date).days)
+                    if diff < best_diff and diff < 60:
+                        best_diff = diff
+                        best_col = col_date
+                if best_col is not None:
+                    rec["revenueActual"] = rev_by_date[best_col]
+                if pd.isna(rec.get("revenueEstimate")) or rec.get("revenueEstimate", 0) == 0:
+                    prior = [v for d, v in rev_by_date.items() if d < rec_date]
+                    if len(prior) >= 1:
+                        rec["revenueEstimate"] = prior[-1]
+                    if len(prior) >= 4:
+                        rec["revenueEstimate"] = prior[-4]
+
     except Exception as e:
         print(f"  ⚠ Earnings fetch failed for {ticker}: {e}")
 
-    # Sort by date descending (most recent first)
-    records.sort(key=lambda r: r.get("date", ""), reverse=True)
+    # Deduplicate by date (prefer Finnhub rows with revenue)
+    by_date: dict[str, dict] = {}
+    for rec in records:
+        d = rec.get("date", "")
+        if d not in by_date:
+            by_date[d] = rec
+        else:
+            existing = by_date[d]
+            if pd.isna(existing.get("revenueActual")) and pd.notna(rec.get("revenueActual")):
+                by_date[d] = rec
+            elif pd.isna(existing.get("revenueEstimate")) and pd.notna(rec.get("revenueEstimate")):
+                existing["revenueEstimate"] = rec["revenueEstimate"]
+
+    records = _normalize_earnings_records(list(by_date.values()))
 
     # Cache to disk
     try:
@@ -545,11 +766,15 @@ def build_training_dataset(
     for etf in set(SECTOR_MAP.values()):
         sector_cache[etf] = compute_sector_momentum(etf, trading_dates, buffer_start, end_date)
 
+    import time
+
     # Step 3: Per-ticker features (with bulk sentiment + pre-market)
     print("  [3/4] Computing per-ticker features + sentiment + pre-market...")
     all_rows = []
 
     for i, ticker in enumerate(tickers):
+        if i > 0:
+            time.sleep(0.25)
         print(f"    [{i+1}/{len(tickers)}] {ticker}...", end=" ", flush=True)
 
         # OHLCV
@@ -595,6 +820,16 @@ def build_training_dataset(
         # Earnings features
         earnings_feats = compute_earnings_features(ticker, ohlcv.index, ohlcv)
 
+        # Catalyst confirmation (premarket proxy + sentiment agreement)
+        catalyst = compute_catalyst_features(
+            ohlcv,
+            sentiment_mean=sent_df["overnight_sentiment_mean"],
+            earnings_catalyst=(
+                0.6 * earnings_feats["eps_surprise_last"]
+                + 0.4 * earnings_feats["revenue_surprise_last"]
+            ),
+        )
+
         # Combine all features
         ticker_features = sent_df.copy()
         ticker_features = ticker_features.join(tech, how="left")
@@ -609,6 +844,7 @@ def build_training_dataset(
         ticker_features["sector_momentum_5d"] = sector_mom.reindex(ticker_features.index, method="ffill")
         ticker_features = ticker_features.join(cal, how="left")
         ticker_features = ticker_features.join(earnings_feats, how="left")
+        ticker_features = ticker_features.join(catalyst, how="left")
 
         # Adaptive target + raw intraday return (for near-spike filtering in model)
         target = compute_adaptive_target(ohlcv)
@@ -779,6 +1015,23 @@ def build_single_day_features(
     if last_idx in earnings_feats.index:
         for col in earnings_feats.columns:
             row[col] = earnings_feats.loc[last_idx, col]
+
+    earn_cat = None
+    if last_idx in earnings_feats.index:
+        earn_cat = (
+            0.6 * earnings_feats.loc[last_idx, "eps_surprise_last"]
+            + 0.4 * earnings_feats.loc[last_idx, "revenue_surprise_last"]
+        )
+    catalyst = compute_catalyst_features(
+        ohlcv,
+        sentiment_mean=pd.Series({last_idx: sent.get("overnight_sentiment_mean", 0)}),
+        earnings_catalyst=pd.Series({last_idx: earn_cat}) if earn_cat is not None else None,
+    )
+    if last_idx in catalyst.index:
+        for col in catalyst.columns:
+            row[col] = catalyst.loc[last_idx, col]
+
+    row = apply_live_premarket_overrides(row, ticker, ohlcv)
 
     if cross_section_cache is not None:
         attach_live_stat_mech(row, ticker, cross_section_cache, beta_mean, beta_std)

@@ -300,7 +300,8 @@ def generate_signals():
         return []
 
     probs = model.predict_for_trade(X)
-    threshold = get_trade_threshold()
+    vix = macro_cache.get("vix")
+    threshold = get_trade_threshold(float(vix) if vix is not None else None)
 
     # Build signal list
     signals = []
@@ -342,7 +343,8 @@ def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
         sys.exit(1)
 
     df = pd.read_csv(csv_path)
-    threshold = get_trade_threshold()
+    vix = df["vix"].iloc[0] if "vix" in df.columns and len(df) else None
+    threshold = get_trade_threshold(float(vix) if vix is not None and pd.notna(vix) else None)
     prob_col = TRADE_PROB_COLUMN if TRADE_PROB_COLUMN in df.columns else "p_spike"
     signals = []
     for _, r in df.iterrows():

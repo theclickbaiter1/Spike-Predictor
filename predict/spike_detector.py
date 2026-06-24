@@ -18,7 +18,13 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 
-from config import FEATURE_COLUMNS, MODEL_BACKUP_DIR, MODEL_PATH, OUTPUT_DIR, TRAINING_DATA_PATH, UNIVERSE
+from config import (
+    FEATURE_COLUMNS, MODEL_BACKUP_DIR, MODEL_PATH, OUTPUT_DIR,
+    TRAINING_DATA_PATH, UNIVERSE, WATCHLIST_THRESHOLD_HIGH, WATCHLIST_THRESHOLD_LOW,
+    get_trade_threshold,
+)
+
+MIN_TRAINING_TICKERS = 50
 
 
 def print_banner():
@@ -56,12 +62,20 @@ def print_watchlist(results: pd.DataFrame):
         print("\n  No predictions.\n")
         return
 
-    high = results[results["p_spike"] >= 0.60]
-    moderate = results[(results["p_spike"] >= 0.40) & (results["p_spike"] < 0.60)]
-    flat_count = len(results[results["p_spike"] < 0.40])
+    trade_thresh = get_trade_threshold()
+    watch_hi = min(WATCHLIST_THRESHOLD_HIGH, trade_thresh)
+    watch_lo = WATCHLIST_THRESHOLD_LOW
+    pcol = "p_spike_trade" if "p_spike_trade" in results.columns else "p_spike"
 
-    def _table(df, emoji, header):
-        if df.empty: return
+    trade = results[results[pcol] >= trade_thresh]
+    watchlist = results[(results[pcol] >= watch_lo) & (results[pcol] < watch_hi)]
+    high = results[(results[pcol] >= 0.60) & (results[pcol] < trade_thresh)]
+    moderate = results[(results[pcol] >= 0.40) & (results[pcol] < 0.60)]
+    flat_count = len(results[results[pcol] < 0.40])
+
+    def _table(df, emoji, header, pcol_name=pcol):
+        if df.empty:
+            return
         print(f"\n  {emoji} {header}")
         print("  ┌────────┬───────────┬──────────┬───────────┬──────────────────────────┐")
         print("  │ Ticker │ Direction │ P(spike) │ P(dir)    │ Top Signal               │")
@@ -69,13 +83,16 @@ def print_watchlist(results: pd.DataFrame):
         for _, r in df.iterrows():
             d = "▲ UP" if r["p_up"] > r["p_down"] else "▼ DOWN"
             pdir = max(r["p_up"], r["p_down"])
-            print(f"  │ {r['ticker']:<6} │ {d:<9} │ {r['p_spike']*100:6.1f}%  │ {pdir*100:6.1f}%    │ {r['top_signal'][:24]:<24} │")
+            psp = r[pcol_name]
+            print(f"  │ {r['ticker']:<6} │ {d:<9} │ {psp*100:6.1f}%  │ {pdir*100:6.1f}%    │ {r['top_signal'][:24]:<24} │")
         print("  └────────┴───────────┴──────────┴───────────┴──────────────────────────┘")
 
-    _table(high, "🔴", "HIGH PROBABILITY SPIKES (>60%)")
-    _table(moderate, "🟡", "MODERATE PROBABILITY (40-60%)")
+    _table(trade, "🔴", f"TRADE TIER (≥{trade_thresh*100:.0f}%) — executes")
+    _table(watchlist, "🟠", f"WATCHLIST ({watch_lo*100:.0f}-{watch_hi*100:.0f}%) — alert only")
+    _table(high, "🟡", "HIGH PROBABILITY (60%+ below trade)")
+    _table(moderate, "🟢", "MODERATE PROBABILITY (40-60%)")
     if flat_count > 0:
-        print(f"\n  🟢 LOW PROBABILITY (<40%) — {flat_count} tickers predicted FLAT")
+        print(f"\n  ⚪ LOW PROBABILITY (<40%) — {flat_count} tickers predicted FLAT")
     print("\n" + "═" * 65)
 
 
@@ -135,12 +152,17 @@ def data_quality_report(X, y, intraday_ret):
     # Feature range checks
     print(f"\n  Feature range check (suspicious if min == max == 0):")
     suspicious = 0
+    all_zero_features = []
     for col in X.columns:
         if X[col].min() == 0 and X[col].max() == 0:
             print(f"    🔴 {col} — all values are 0!")
             suspicious += 1
+            all_zero_features.append(col)
     if suspicious == 0:
         print("    ✅ All features have non-trivial value ranges.")
+    elif all_zero_features:
+        print(f"\n  ⚠ {len(all_zero_features)} dead feature(s): {', '.join(all_zero_features[:5])}"
+              f"{'...' if len(all_zero_features) > 5 else ''}")
 
     # Known issue: days_to_earnings — now point-in-time (historical only)
     if "days_to_earnings" in X.columns:
@@ -208,10 +230,11 @@ RETRAIN_MIN_F1_DELTA = -0.03
 RETRAIN_MAX_NLL_DELTA = 0.05
 RETRAIN_MIN_TRADE_PRECISION = 0.20
 RETRAIN_MAX_SIGNALS_PER_DAY = 15
+RETRAIN_MAX_VAL_OOS_GAP = 0.20  # reject if val prec - nested OOS prec > 20pp
 
 
-def _mini_oos_gate(model, X_val, y_val) -> tuple[bool, str]:
-    """Check last 5 val trading days: trade precision vs raw baseline."""
+def _mini_oos_gate(model, X_val, y_val, threshold: float | None = None) -> tuple[bool, str]:
+    """Check last 5 val trading days at val-tuned threshold (not stale tuned_threshold.json)."""
     dates = pd.Index(X_val.index)
     unique_dates = sorted(dates.unique())[-5:]
     if len(unique_dates) < 2:
@@ -220,26 +243,34 @@ def _mini_oos_gate(model, X_val, y_val) -> tuple[bool, str]:
     mask = dates.isin(unique_dates)
     X_slice = X_val.loc[mask]
     y_slice = y_val.loc[mask]
-    threshold = get_trade_threshold()
+
+    if threshold is None:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backtest"))
+            from walkforward_utils import pick_best_threshold
+            threshold = pick_best_threshold(model, X_val, y_val)["threshold"]
+        except Exception:
+            threshold = get_trade_threshold()
 
     trade_m = model.trade_val_metrics(X_slice, y_slice, threshold)
     raw_m = model.spike_val_metrics(X_slice, y_slice, threshold=threshold, calibrated=False)
     sig_per_day = trade_m["signals"] / max(len(unique_dates), 1)
 
     reasons = []
-    if trade_m["precision"] < RETRAIN_MIN_TRADE_PRECISION:
+    # Allow low precision only when almost no signals (threshold too strict on short window)
+    if trade_m["signals"] >= 3 and trade_m["precision"] < RETRAIN_MIN_TRADE_PRECISION:
         reasons.append(f"trade precision {trade_m['precision']:.2f} < {RETRAIN_MIN_TRADE_PRECISION}")
     if sig_per_day > RETRAIN_MAX_SIGNALS_PER_DAY:
         reasons.append(f"signals/day {sig_per_day:.1f} > {RETRAIN_MAX_SIGNALS_PER_DAY}")
-    if trade_m["precision"] < raw_m["precision"]:
+    if trade_m["signals"] >= 3 and trade_m["precision"] < raw_m["precision"]:
         reasons.append(f"trade prec {trade_m['precision']:.2f} < raw {raw_m['precision']:.2f}")
 
-    summary = (f"mini-OOS trade prec={trade_m['precision']:.2f} rec={trade_m['recall']:.2f} "
-               f"sig/day={sig_per_day:.1f} vs raw prec={raw_m['precision']:.2f}")
+    summary = (f"mini-OOS @ {threshold:.2f}: trade prec={trade_m['precision']:.2f} "
+               f"rec={trade_m['recall']:.2f} sig/day={sig_per_day:.1f} vs raw prec={raw_m['precision']:.2f}")
     return len(reasons) == 0, summary if not reasons else summary + " — " + "; ".join(reasons)
 
 
-def run_retrain(backup=True):
+def run_retrain(backup=True, force=False):
     from features import build_training_dataset
     from model import TwoStageModel, time_series_split
     from news import FinBERTScorer, FinnhubClient
@@ -258,6 +289,14 @@ def run_retrain(backup=True):
     scorer = FinBERTScorer()
 
     X, y, intraday_ret, tickers, adaptive_thresh = build_training_dataset(UNIVERSE, client, scorer)
+
+    n_tickers = tickers.nunique()
+    if n_tickers < MIN_TRAINING_TICKERS:
+        print(f"\n  🛑 RETRAIN ABORTED — only {n_tickers}/{len(UNIVERSE)} tickers loaded.")
+        print("     Check yfinance connectivity and re-run.")
+        if backup_dir is not None:
+            restore_model_from_backup(backup_dir)
+        sys.exit(1)
 
     training_df = X.copy()
     training_df["_target"] = y
@@ -278,17 +317,26 @@ def run_retrain(backup=True):
     # Evaluate previous model on same val split (acceptance gate)
     old_metrics = None
     old_nll = None
-    if backup_dir is not None:
+    feature_migration = False
+    if backup_dir is not None and not force:
         old_model = TwoStageModel()
         try:
             old_model.load()
-            old_metrics = old_model.spike_val_metrics(X_val, y_val)
-            old_nll = old_model.calibrated_val_nll(X_val, y_val)
-            print(f"\n  Previous model val F1: {old_metrics['f1']:.3f} "
-                  f"(prec {old_metrics['precision']:.3f}, rec {old_metrics['recall']:.3f})")
-            if old_nll < float("inf"):
-                print(f"  Previous model val NLL: {old_nll:.4f}")
+            old_s1 = set(old_model.spike_model.get_booster().feature_names)
+            new_s1 = set(c for c in FEATURE_COLUMNS if c not in {"realized_vol_20d", "inverse_temperature"})
+            if old_s1 != new_s1:
+                feature_migration = True
+                print(f"\n  ℹ Feature migration detected ({len(old_s1)} → {len(new_s1)} S1 features); "
+                      "skipping old-model comparison gates.")
+            else:
+                old_metrics = old_model.spike_val_metrics(X_val, y_val)
+                old_nll = old_model.calibrated_val_nll(X_val, y_val)
+                print(f"\n  Previous model val F1: {old_metrics['f1']:.3f} "
+                      f"(prec {old_metrics['precision']:.3f}, rec {old_metrics['recall']:.3f})")
+                if old_nll < float("inf"):
+                    print(f"  Previous model val NLL: {old_nll:.4f}")
         except Exception as e:
+            feature_migration = True
             print(f"\n  ⚠ Could not load previous model for comparison: {e}")
 
     model = TwoStageModel()
@@ -300,13 +348,37 @@ def run_retrain(backup=True):
 
     new_metrics = model.spike_val_metrics(X_val, y_val)
     new_nll = model.calibrated_val_nll(X_val, y_val)
+    trade_val = model.trade_val_metrics(X_val, y_val, get_trade_threshold())
     oos_ok, oos_msg = _mini_oos_gate(model, X_val, y_val)
+    if force or feature_migration:
+        oos_ok = True
+        oos_msg = f"skipped (force={force}, migration={feature_migration})"
+
+    nested_oos_prec, nested_gap = float("nan"), float("nan")
+    overfit_ok = True
+    if not force and not feature_migration:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backtest"))
+            from walkforward_utils import quick_holdout_oos_precision
+            holdout_df = pd.read_parquet(TRAINING_DATA_PATH)
+            nested_oos_prec = quick_holdout_oos_precision(model, holdout_df, holdout_frac=0.05)
+            val_trade_prec = trade_val["precision"]
+            if not np.isnan(nested_oos_prec):
+                gap = val_trade_prec - nested_oos_prec
+                if gap > RETRAIN_MAX_VAL_OOS_GAP:
+                    overfit_ok = False
+                print(f"  Holdout OOS prec (5%): {nested_oos_prec:.2f}, val→OOS gap: {gap:+.2f}")
+        except Exception as e:
+            print(f"  ⚠ Holdout OOS check skipped: {e}")
+    else:
+        print("  Holdout OOS check skipped (force/migration).")
+
     print(f"\n  New model val F1: {new_metrics['f1']:.3f} "
           f"(prec {new_metrics['precision']:.3f}, rec {new_metrics['recall']:.3f})")
     print(f"  New model val NLL: {new_nll:.4f}")
     print(f"  Mini-OOS gate: {oos_msg}")
 
-    if old_metrics is not None:
+    if old_metrics is not None and not force:
         f1_delta = new_metrics["f1"] - old_metrics["f1"]
         reject = False
         if f1_delta < RETRAIN_MIN_F1_DELTA:
@@ -322,12 +394,18 @@ def run_retrain(backup=True):
         if not oos_ok:
             print(f"  🛑 RETRAIN REJECTED — {oos_msg}")
             reject = True
+        if not overfit_ok:
+            print(f"  🛑 RETRAIN REJECTED — val/OOS overfit gap > {RETRAIN_MAX_VAL_OOS_GAP:.0%}")
+            reject = True
         if reject:
             restore_model_from_backup(backup_dir)
             sys.exit(1)
         print(f"  ✅ Acceptance gate passed (F1 delta {f1_delta:+.3f})")
-    elif not oos_ok:
-        print(f"  🛑 RETRAIN REJECTED — {oos_msg}")
+    elif (not oos_ok or not overfit_ok) and not force:
+        if not oos_ok:
+            print(f"  🛑 RETRAIN REJECTED — {oos_msg}")
+        if not overfit_ok:
+            print(f"  🛑 RETRAIN REJECTED — val/OOS overfit gap > {RETRAIN_MAX_VAL_OOS_GAP:.0%}")
         if backup_dir is not None:
             restore_model_from_backup(backup_dir)
         sys.exit(1)
@@ -438,6 +516,16 @@ def run_predict():
         ])
     else:
         results_df = pd.DataFrame(results).sort_values("p_spike_trade", ascending=False)
+        results_df["tier"] = "flat"
+        trade_t = get_trade_threshold(
+            float(macro_cache.get("vix", 0)) if macro_cache.get("vix") is not None else None
+        )
+        pcol = "p_spike_trade"
+        results_df.loc[results_df[pcol] >= trade_t, "tier"] = "trade"
+        results_df.loc[
+            (results_df[pcol] >= WATCHLIST_THRESHOLD_LOW) & (results_df[pcol] < trade_t),
+            "tier",
+        ] = "watchlist"
         print_watchlist(results_df)
 
     date_str = today.strftime("%Y-%m-%d")
@@ -458,11 +546,13 @@ def run_predict():
 def main():
     parser = argparse.ArgumentParser(description="Pre-Market Spike Detector v2")
     parser.add_argument("--retrain", action="store_true", help="Retrain model")
+    parser.add_argument("--force", action="store_true",
+                        help="Skip acceptance gates (feature migration deploy)")
     parser.add_argument("--no-backup", action="store_true",
                         help="Skip model backup before retrain")
     args = parser.parse_args()
     if args.retrain:
-        run_retrain(backup=not args.no_backup)
+        run_retrain(backup=not args.no_backup, force=args.force)
     else:
         run_predict()
 

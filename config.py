@@ -5,6 +5,7 @@ config.py — Central configuration for the Pre-Market Spike Detector.
 import os
 from pathlib import Path
 
+import numpy as np
 from dotenv import load_dotenv
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -37,7 +38,11 @@ ALPACA_LIVE_URL = "https://api.alpaca.markets"
 
 # ── Trading Strategy ─────────────────────────────────────────────────────────
 TRADE_THRESHOLD = 0.55           # Default; overridden by data/tuned_threshold.json if present
+WATCHLIST_THRESHOLD_LOW = 0.50   # Two-tier: alert-only watchlist floor
+WATCHLIST_THRESHOLD_HIGH = 0.70  # Trade tier uses get_trade_threshold() (tuned)
 TRADE_PROB_COLUMN = "p_spike_trade"
+VIX_LOW_MAX = 15.0
+VIX_MID_MAX = 25.0
 DIRECTION_MARGIN_MIN = 0.12        # min max(p_up,p_down)/p_spike to trade direction
 SECTOR_AGREEMENT_REQUIRED = True # coupling_alignment sign must match direction
 TUNED_THRESHOLD_PATH = DATA_DIR / "tuned_threshold.json"
@@ -124,6 +129,8 @@ SECTOR_MAP = {
 }
 
 # ── XGBoost — Stage 1: Spike Detector (binary) ──────────────────────────────
+S1_EVAL_METRIC = "aucpr"           # PR-AUC for rare-event early stopping
+S1_POS_WEIGHT_MULTIPLIER = 1.0     # Multiply scale_pos_weight; sweep via ablation_study.py
 XGB_PARAMS_S1 = dict(
     objective="binary:logistic",
     n_estimators=500,
@@ -134,7 +141,7 @@ XGB_PARAMS_S1 = dict(
     reg_alpha=0.1,
     reg_lambda=1.0,
     tree_method="hist",
-    eval_metric="logloss",
+    eval_metric="aucpr",
     random_state=42,
     early_stopping_rounds=50,
 )
@@ -198,7 +205,14 @@ STAT_MECH_COLUMNS = [
     "criticality_proxy",
 ]
 
-# ── Feature Column Order (45 + 9 stat-mech = 54 features) ─────────────────────
+# ── Feature Column Order (45 + 4 catalyst + 9 stat-mech = 58 features) ─────
+CATALYST_COLUMNS = [
+    "premarket_gap_pct",
+    "premarket_volume_ratio",
+    "gap_sentiment_agreement",
+    "earnings_catalyst_score",
+]
+
 FEATURE_COLUMNS = [
     # Sentiment (7)
     "overnight_sentiment_mean", "overnight_sentiment_max",
@@ -222,7 +236,7 @@ FEATURE_COLUMNS = [
     # Earnings (5)
     "eps_surprise_last", "revenue_surprise_last", "earnings_streak",
     "post_earnings_drift_1d", "earnings_volatility",
-] + STAT_MECH_COLUMNS
+] + CATALYST_COLUMNS + STAT_MECH_COLUMNS
 
 # ── Label Encoding ───────────────────────────────────────────────────────────
 LABEL_MAP = {-1: 0, 0: 1, 1: 2}
@@ -230,13 +244,25 @@ LABEL_MAP_INV = {v: k for k, v in LABEL_MAP.items()}
 LABEL_NAMES = ["spike_down", "flat", "spike_up"]
 
 
-def get_trade_threshold() -> float:
-    """Load walk-forward tuned threshold if available, else TRADE_THRESHOLD."""
+def get_trade_threshold(vix: float | None = None) -> float:
+    """
+    Load walk-forward tuned threshold if available, else TRADE_THRESHOLD.
+    When vix is provided and tuned_threshold.json has regime buckets, pick by VIX.
+    """
     import json
     if TUNED_THRESHOLD_PATH.exists():
         try:
             with open(TUNED_THRESHOLD_PATH) as f:
-                return float(json.load(f).get("threshold", TRADE_THRESHOLD))
+                data = json.load(f)
+            if vix is not None and not (isinstance(vix, float) and np.isnan(vix)):
+                vix = float(vix)
+                if vix >= VIX_MID_MAX and "vix_high" in data:
+                    return float(data["vix_high"].get("threshold", data.get("default", TRADE_THRESHOLD)))
+                if vix >= VIX_LOW_MAX and "vix_mid" in data:
+                    return float(data["vix_mid"].get("threshold", data.get("default", TRADE_THRESHOLD)))
+                if "vix_low" in data:
+                    return float(data["vix_low"].get("threshold", data.get("default", TRADE_THRESHOLD)))
+            return float(data.get("threshold", data.get("default", TRADE_THRESHOLD)))
         except (json.JSONDecodeError, TypeError, ValueError):
             pass
     return TRADE_THRESHOLD

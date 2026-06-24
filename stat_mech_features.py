@@ -88,6 +88,18 @@ def normalize_inverse_temperature(
     return (beta - mean) / std
 
 
+def _positions_for_date(index: pd.Index, date, n: int) -> list[int]:
+    """Integer row positions for all rows on a given date (duplicate index safe)."""
+    loc = index.get_loc(date)
+    if isinstance(loc, np.ndarray):
+        if loc.dtype == bool:
+            return np.where(loc)[0].tolist()
+        return loc.tolist()
+    if isinstance(loc, slice):
+        return list(range(loc.start or 0, loc.stop or n))
+    return [int(loc)]
+
+
 def enrich_training_frame(
     df: pd.DataFrame,
     beta_mean: float | None = None,
@@ -95,33 +107,37 @@ def enrich_training_frame(
 ) -> pd.DataFrame:
     """
     Add stat-mech columns to combined training frame (index=date, _ticker column).
+    Uses integer positions for assignment — index has duplicate dates (one per ticker).
     """
     out = df.copy()
     if "_ticker" not in out.columns:
         raise ValueError("enrich_training_frame requires _ticker column")
 
     out["_spin"] = out["overnight_gap"].apply(spin_from_gap)
+    n = len(out)
+    sector_mag = np.zeros(n, dtype=float)
+
+    for date, grp in out.groupby(out.index):
+        pos_list = _positions_for_date(out.index, date, n)
+        tickers = out.iloc[pos_list]["_ticker"].values
+        spins = dict(zip(tickers, out.iloc[pos_list]["_spin"].values))
+        for pos, ticker in zip(pos_list, tickers):
+            sector = SECTOR_MAP.get(ticker, "XLK")
+            peer_spins = [
+                s for t, s in spins.items()
+                if t != ticker and SECTOR_MAP.get(t, "XLK") == sector
+            ]
+            sector_mag[pos] = float(np.mean(peer_spins)) if peer_spins else 0.0
 
     xs_map = {
         date: cross_section_entropy_from_gaps(grp["overnight_gap"])
         for date, grp in out.groupby(out.index)
     }
-    out["cross_section_entropy"] = out.index.map(xs_map)
-
-    sector_mag = pd.Series(index=out.index, dtype=float)
-    for date, grp in out.groupby(out.index):
-        for idx, row in grp.iterrows():
-            ticker = row["_ticker"]
-            sector = SECTOR_MAP.get(ticker, "XLK")
-            peers = grp[
-                (grp["_ticker"] != ticker)
-                & (grp["_ticker"].map(lambda t: SECTOR_MAP.get(t, "XLK") == sector))
-            ]
-            sector_mag.loc[idx] = float(peers["_spin"].mean()) if len(peers) else 0.0
-
+    cross_section = out.index.map(xs_map).astype(float)
+    out["cross_section_entropy"] = cross_section
     out["sector_magnetization"] = sector_mag
-    out["sector_abs_magnetization"] = out["sector_magnetization"].abs()
-    out["coupling_alignment"] = out["_spin"] * out["sector_magnetization"]
+    out["sector_abs_magnetization"] = np.abs(sector_mag)
+    out["coupling_alignment"] = out["_spin"].values * sector_mag
     out["local_field"] = out.apply(compute_local_field, axis=1)
 
     if "vix" in out.columns:
@@ -130,13 +146,13 @@ def enrich_training_frame(
         beta_raw = pd.Series(0.1, index=out.index)
     out["inverse_temperature"] = normalize_inverse_temperature(beta_raw, beta_mean, beta_std)
 
-    sus = pd.Series(index=out.index, dtype=float)
+    sus = np.zeros(n, dtype=float)
     for ticker in out["_ticker"].unique():
-        mask = out["_ticker"] == ticker
-        rolling_std = out.loc[mask, "sector_magnetization"].rolling(20, min_periods=5).std()
-        sus.loc[mask] = rolling_std.values
+        mask = (out["_ticker"] == ticker).values
+        rolling_std = pd.Series(sector_mag[mask]).rolling(20, min_periods=5).std().values
+        sus[mask] = np.nan_to_num(rolling_std, nan=0.0)
     out["susceptibility_proxy"] = sus
-    out["criticality_proxy"] = out["susceptibility_proxy"].fillna(0) * out["cross_section_entropy"]
+    out["criticality_proxy"] = sus * cross_section
 
     if "sentiment_entropy" not in out.columns:
         out["sentiment_entropy"] = 0.0

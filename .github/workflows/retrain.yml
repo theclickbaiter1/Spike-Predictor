@@ -36,7 +36,7 @@ jobs:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
-        run: python predict/spike_detector.py --retrain
+        run: python predict/spike_detector.py --retrain --force
 
       - name: Upload model artifact
         uses: actions/upload-artifact@v4

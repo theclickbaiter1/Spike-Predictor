@@ -65,6 +65,44 @@ def fetch_actuals(date_str: str) -> dict:
     return actuals
 
 
+def fetch_vix_for_date(date_str: str) -> float | None:
+    try:
+        end = (datetime.strptime(date_str, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        data = yf.download("^VIX", start=date_str, end=end, progress=False)
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.droplevel(1)
+        if not data.empty:
+            return float(data.iloc[0]["Close"])
+    except Exception:
+        pass
+    return None
+
+
+def compute_trade_prob_metrics(per_ticker: list[dict], threshold: float) -> dict:
+    """Precision using p_spike_trade vs p_spike_raw if present in history rows."""
+    df = pd.DataFrame(per_ticker)
+    actual_spike = df["actual_class"] != "FLAT"
+    out = {}
+    for col in ["p_spike_trade", "p_spike"]:
+        if col not in df.columns:
+            continue
+        pred = df[col] >= threshold
+        if pred.sum() == 0:
+            out[f"{col}_precision"] = 0.0
+        else:
+            out[f"{col}_precision"] = float((pred & actual_spike).sum() / pred.sum())
+    return out
+
+
+def rolling_precision_alert(metrics_df: pd.DataFrame, window: int = 10, floor: float = 0.25) -> str | None:
+    if len(metrics_df) < window:
+        return None
+    recent = metrics_df.tail(window)["spike_precision"].mean()
+    if recent < floor:
+        return f"ALERT: {window}d rolling spike precision {recent:.1%} < {floor:.0%}"
+    return None
+
+
 def compute_daily_metrics(per_ticker: list[dict]) -> dict:
     df = pd.DataFrame(per_ticker)
     actual_spikes = df[df["actual_class"] != "FLAT"]
@@ -172,6 +210,9 @@ def main():
         print("  ! No actuals fetched — yfinance returned empty for all tickers. Aborting.")
         sys.exit(1)
 
+    vix_level = fetch_vix_for_date(date_str)
+    trade_threshold = get_trade_threshold(vix_level)
+
     per_ticker = []
     for _, r in watchlist.iterrows():
         ticker = r["ticker"]
@@ -182,13 +223,14 @@ def main():
         pred_dir = "UP" if r["p_up"] > r["p_down"] else "DOWN"
         prob_col = TRADE_PROB_COLUMN if TRADE_PROB_COLUMN in r.index else "p_spike"
         p_trade = float(r.get(prob_col, r["p_spike"]))
-        threshold = get_trade_threshold()
-        pred_class = "FLAT" if p_trade < threshold else f"SPIKE {pred_dir}"
+        p_raw = float(r.get("p_spike_raw", r["p_spike"]))
+        pred_class = "FLAT" if p_trade < trade_threshold else f"SPIKE {pred_dir}"
 
         per_ticker.append({
             "date": date_str,
             "ticker": ticker,
             "p_spike": float(r["p_spike"]),
+            "p_spike_raw": p_raw,
             "p_spike_trade": p_trade,
             "p_up": float(r["p_up"]),
             "p_down": float(r["p_down"]),
@@ -214,7 +256,11 @@ def main():
     history.to_csv(HISTORY_CSV, index=False)
 
     today_metrics = compute_daily_metrics(per_ticker)
+    today_metrics.update(compute_trade_prob_metrics(per_ticker, trade_threshold))
     today_metrics["date"] = date_str
+    today_metrics["trade_threshold"] = trade_threshold
+    if vix_level is not None:
+        today_metrics["vix"] = vix_level
     if METRICS_CSV.exists():
         metrics_df = pd.read_csv(METRICS_CSV)
         metrics_df = metrics_df[metrics_df["date"] != date_str]
@@ -237,6 +283,14 @@ def main():
     print(f"  Direction acc:      {today_metrics['direction_accuracy']*100:5.1f}%  (on caught spikes)")
     print(f"  Signal return long: {today_metrics['long_signal_return']*100:+.2f}%")
     print(f"  Signal return short:{today_metrics['short_signal_return']*100:+.2f}%")
+    if "p_spike_raw_precision" in today_metrics:
+        print(f"  Raw prec @ {trade_threshold:.2f}:   {today_metrics['p_spike_raw_precision']*100:5.1f}%")
+    if "p_spike_trade_precision" in today_metrics:
+        print(f"  Trade prec @ {trade_threshold:.2f}: {today_metrics['p_spike_trade_precision']*100:5.1f}%")
+
+    alert = rolling_precision_alert(metrics_df)
+    if alert:
+        print(f"\n  ⚠ {alert}")
 
     # Side-by-side: predicted spikes vs reality
     pred_spikes_today = [r for r in per_ticker if r["pred_class"] != "FLAT"]

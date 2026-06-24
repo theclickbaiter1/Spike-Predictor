@@ -30,7 +30,10 @@ from datetime import datetime, timezone
 
 import requests
 
-from config import DATA_DIR, OUTPUT_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADE_LOG_PATH
+from config import (
+    DATA_DIR, OUTPUT_DIR, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TRADE_LOG_PATH,
+    WATCHLIST_THRESHOLD_LOW, get_trade_threshold,
+)
 
 SUBSCRIBERS_PATH = DATA_DIR / "subscribers.json"
 
@@ -176,31 +179,36 @@ def format_watchlist(csv_path: str) -> str:
 
     df = pd.read_csv(csv_path)
     date_str = datetime.now().strftime("%Y-%m-%d")
+    pcol = "p_spike_trade" if "p_spike_trade" in df.columns else "p_spike"
+    trade_thresh = get_trade_threshold()
 
     lines = [f"*Spike Detector — {date_str}*\n"]
 
-    high = df[df["p_spike"] >= 0.60]
-    moderate = df[(df["p_spike"] >= 0.40) & (df["p_spike"] < 0.60)]
-    low_count = len(df[df["p_spike"] < 0.40])
+    trade = df[df[pcol] >= trade_thresh]
+    watchlist = df[(df[pcol] >= WATCHLIST_THRESHOLD_LOW) & (df[pcol] < trade_thresh)]
+    high = df[(df[pcol] >= 0.60) & (df[pcol] < trade_thresh)]
+    moderate = df[(df[pcol] >= 0.40) & (df[pcol] < 0.60)]
+    low_count = len(df[df[pcol] < 0.40])
 
-    if not high.empty:
-        lines.append("🔴 *HIGH PROBABILITY (>60%)*")
-        for _, r in high.iterrows():
+    def _section(subset, title):
+        if subset.empty:
+            return
+        lines.append(title)
+        for _, r in subset.iterrows():
             d = "▲" if r["p_up"] > r["p_down"] else "▼"
-            lines.append(f"  `{r['ticker']:<6}` {d} {r['p_spike']*100:.0f}%  — {r['top_signal']}")
+            sig = r.get("top_signal", "")
+            lines.append(f"  `{r['ticker']:<6}` {d} {r[pcol]*100:.0f}%  — {sig}")
         lines.append("")
 
-    if not moderate.empty:
-        lines.append("🟡 *MODERATE (40-60%)*")
-        for _, r in moderate.iterrows():
-            d = "▲" if r["p_up"] > r["p_down"] else "▼"
-            lines.append(f"  `{r['ticker']:<6}` {d} {r['p_spike']*100:.0f}%  — {r['top_signal']}")
-        lines.append("")
+    _section(trade, f"🔴 *TRADE (≥{trade_thresh*100:.0f}%)*")
+    _section(watchlist, f"🟠 *WATCHLIST ({WATCHLIST_THRESHOLD_LOW*100:.0f}-{trade_thresh*100:.0f}%)* — alert only")
+    _section(high, "🟡 *HIGH (60%+)*")
+    _section(moderate, "🟢 *MODERATE (40-60%)*")
 
-    if high.empty and moderate.empty:
+    if trade.empty and watchlist.empty and high.empty and moderate.empty:
         lines.append("🟢 No significant spikes predicted today.")
     elif low_count > 0:
-        lines.append(f"🟢 {low_count} tickers predicted FLAT (<40%)")
+        lines.append(f"⚪ {low_count} tickers predicted FLAT (<40%)")
 
     return "\n".join(lines)
 
