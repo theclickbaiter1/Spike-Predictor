@@ -15,6 +15,10 @@ jobs:
         with:
           lfs: false
 
+      - name: Set ET date
+        id: et_date
+        run: echo "today=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_OUTPUT
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -82,10 +86,6 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python predict/notify.py --trades --label open
-
-      - name: Set ET date
-        id: et_date
-        run: echo "today=$(TZ='America/New_York' date +%Y-%m-%d)" >> $GITHUB_OUTPUT
 
       - name: Save watchlist (stable name for validation pickup)
         if: always()
