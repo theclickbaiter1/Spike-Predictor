@@ -51,6 +51,47 @@ from config import (
 
 ET = ZoneInfo("America/New_York")
 
+CANONICAL_TRADE_FIELDS = [
+    "date", "time", "ticker", "direction", "qty", "entry_price",
+    "take_profit", "stop_loss", "p_spike", "p_spike_raw", "p_spike_trade", "p_dir", "order_id", "mode",
+]
+LEGACY_TRADE_FIELDS = [
+    "date", "time", "ticker", "direction", "qty", "entry_price",
+    "take_profit", "stop_loss", "p_spike", "p_dir", "order_id", "mode",
+]
+
+
+def read_trade_log(path: Path) -> pd.DataFrame:
+    """Load trade log, tolerating legacy 12-column rows mixed with newer 14-column rows."""
+    if not path.exists():
+        return pd.DataFrame(columns=CANONICAL_TRADE_FIELDS)
+
+    rows = []
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)  # skip header (may be stale)
+        for row in reader:
+            if len(row) == len(CANONICAL_TRADE_FIELDS):
+                rec = dict(zip(CANONICAL_TRADE_FIELDS, row))
+            elif len(row) == len(LEGACY_TRADE_FIELDS):
+                rec = dict(zip(LEGACY_TRADE_FIELDS, row))
+                rec["p_spike_raw"] = rec["p_spike"]
+                rec["p_spike_trade"] = rec["p_spike"]
+            else:
+                continue
+            rows.append(rec)
+
+    if not rows:
+        return pd.DataFrame(columns=CANONICAL_TRADE_FIELDS)
+    return pd.DataFrame(rows)
+
+
+def write_trade_log(path: Path, df: pd.DataFrame) -> None:
+    """Write trade log with canonical header."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out = df.reindex(columns=CANONICAL_TRADE_FIELDS)
+    out.to_csv(path, index=False)
+
 
 def alpaca_credentials(label: str = "open") -> tuple[str, str]:
     """Return API key/secret for the given account label."""
@@ -162,10 +203,7 @@ def trade_log_path(label: str) -> Path:
 def load_recent_trades(days=5, label: str = "open"):
     """Load trade log and return tickers traded in recent days."""
     path = trade_log_path(label)
-    if not path.exists():
-        return {}
-
-    df = pd.read_csv(path)
+    df = read_trade_log(path)
     if df.empty or "date" not in df.columns:
         return {}
 
@@ -205,17 +243,13 @@ def log_trades(trades, label: str = "open"):
         return
 
     path = trade_log_path(label)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = path.exists()
-    with open(path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "date", "time", "ticker", "direction", "qty", "entry_price",
-            "take_profit", "stop_loss", "p_spike", "p_spike_raw", "p_spike_trade", "p_dir", "order_id", "mode",
-        ])
-        if not file_exists:
-            writer.writeheader()
-        for t in trades:
-            writer.writerow(t)
+    existing = read_trade_log(path)
+    new_df = pd.DataFrame(trades)
+    for col in ("p_spike_raw", "p_spike_trade"):
+        if col not in new_df.columns:
+            new_df[col] = new_df["p_spike"]
+    new_df = new_df.reindex(columns=CANONICAL_TRADE_FIELDS)
+    write_trade_log(path, pd.concat([existing, new_df], ignore_index=True))
 
 
 # ── Signal Generation ────────────────────────────────────────────────────────

@@ -215,7 +215,10 @@ def format_watchlist(csv_path: str) -> str:
 
 def format_trade_summary(csv_path: str = None, label: str = "open") -> str:
     """Format today's trades from the per-account trade log for Telegram."""
-    import pandas as pd
+    predict_dir = Path(__file__).resolve().parent
+    if str(predict_dir) not in sys.path:
+        sys.path.insert(0, str(predict_dir))
+    from trade import read_trade_log
 
     if csv_path:
         path = Path(csv_path)
@@ -228,7 +231,7 @@ def format_trade_summary(csv_path: str = None, label: str = "open") -> str:
     if not path.exists():
         return f"*Spike Trader [{tag}]* — No trade log found."
 
-    df = pd.read_csv(path)
+    df = read_trade_log(path)
     if df.empty:
         return f"*Spike Trader [{tag}]* — No trades recorded."
 
@@ -244,11 +247,12 @@ def format_trade_summary(csv_path: str = None, label: str = "open") -> str:
 
     for _, t in df_today.iterrows():
         d = "▲" if t["direction"] == "LONG" else "▼"
+        p_disp = t.get("p_spike_trade", t["p_spike"])
         lines.append(
             f"  `{t['ticker']:<6}` {d} {t['direction']}  "
-            f"{t['qty']} shares @ ${t['entry_price']:.2f}\n"
-            f"        TP=${t['take_profit']:.2f}  SL=${t['stop_loss']:.2f}  "
-            f"P(spike)={t['p_spike']*100:.0f}%"
+            f"{t['qty']} shares @ ${float(t['entry_price']):.2f}\n"
+            f"        TP=${float(t['take_profit']):.2f}  SL=${float(t['stop_loss']):.2f}  "
+            f"P(spike)={float(p_disp)*100:.0f}%"
         )
 
     mode = df_today.iloc[0].get("mode", "unknown")

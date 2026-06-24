@@ -45,14 +45,47 @@ jobs:
           key: trade-log-delayed-${{ github.run_id }}
           restore-keys: trade-log-delayed-
 
+      - name: Wait for morning watchlist artifact
+        id: wait_watchlist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TODAY="${{ steps.et_date.outputs.today }}"
+          NAME="watchlist-${TODAY}"
+          REPO="${{ github.repository }}"
+          echo "Waiting for artifact ${NAME} from daily_trade.yml ..."
+          for i in $(seq 1 40); do
+            for run in $(gh api "/repos/${REPO}/actions/workflows/daily_trade.yml/runs?per_page=8&status=completed" \
+              --jq '.workflow_runs[].id'); do
+              if gh api "/repos/${REPO}/actions/runs/${run}/artifacts" \
+                --jq ".artifacts[] | select(.name==\"${NAME}\") | .id" | grep -q .; then
+                echo "Found ${NAME} on run ${run}"
+                echo "run_id=${run}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            done
+            # Also check in-progress runs (watchlist uploads with if: always after predict)
+            for run in $(gh api "/repos/${REPO}/actions/workflows/daily_trade.yml/runs?per_page=3&status=in_progress" \
+              --jq '.workflow_runs[].id'); do
+              if gh api "/repos/${REPO}/actions/runs/${run}/artifacts" \
+                --jq ".artifacts[] | select(.name==\"${NAME}\") | .id" | grep -q .; then
+                echo "Found ${NAME} on in-progress run ${run}"
+                echo "run_id=${run}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            done
+            echo "Attempt ${i}/40 — not ready, sleeping 30s"
+            sleep 30
+          done
+          echo "::error::Morning watchlist ${NAME} not found after 20 min. Run daily_trade first."
+          exit 1
+
       - name: Download morning watchlist
         uses: dawidd6/action-download-artifact@v3
         with:
           name: watchlist-${{ steps.et_date.outputs.today }}
           path: output/
-          workflow: daily_trade.yml
-          workflow_conclusion: success
-          search_artifacts: true
+          run_id: ${{ steps.wait_watchlist.outputs.run_id }}
           if_no_artifact_found: fail
 
       - name: Place paper trades (Account DELAYED — 10:00 fill)
