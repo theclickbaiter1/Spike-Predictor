@@ -32,6 +32,7 @@ from config import (
     ALPACA_SECRET_KEY,
     ALPACA_SECRET_KEY_DELAYED,
     DIRECTION_MARGIN_MIN,
+    ENTRY_ORDER_TYPE,
     FEATURE_COLUMNS,
     LIMIT_ENTRY_DIP_PCT,
     MAX_CONSECUTIVE_TICKER_DAYS,
@@ -53,16 +54,41 @@ ET = ZoneInfo("America/New_York")
 
 CANONICAL_TRADE_FIELDS = [
     "date", "time", "ticker", "direction", "qty", "entry_price",
+    "take_profit", "stop_loss", "p_spike", "p_spike_raw", "p_spike_trade", "p_dir",
+    "order_id", "mode", "order_status", "filled_qty",
+]
+LEGACY_TRADE_FIELDS_V2 = [
+    "date", "time", "ticker", "direction", "qty", "entry_price",
     "take_profit", "stop_loss", "p_spike", "p_spike_raw", "p_spike_trade", "p_dir", "order_id", "mode",
 ]
+
+
 LEGACY_TRADE_FIELDS = [
     "date", "time", "ticker", "direction", "qty", "entry_price",
     "take_profit", "stop_loss", "p_spike", "p_dir", "order_id", "mode",
 ]
 
 
+def _normalize_trade_row(row: list[str]) -> dict | None:
+    if len(row) == len(CANONICAL_TRADE_FIELDS):
+        rec = dict(zip(CANONICAL_TRADE_FIELDS, row))
+    elif len(row) == len(LEGACY_TRADE_FIELDS_V2):
+        rec = dict(zip(LEGACY_TRADE_FIELDS_V2, row))
+        rec["order_status"] = ""
+        rec["filled_qty"] = ""
+    elif len(row) == len(LEGACY_TRADE_FIELDS):
+        rec = dict(zip(LEGACY_TRADE_FIELDS, row))
+        rec["p_spike_raw"] = rec["p_spike"]
+        rec["p_spike_trade"] = rec["p_spike"]
+        rec["order_status"] = ""
+        rec["filled_qty"] = ""
+    else:
+        return None
+    return rec
+
+
 def read_trade_log(path: Path) -> pd.DataFrame:
-    """Load trade log, tolerating legacy 12-column rows mixed with newer 14-column rows."""
+    """Load trade log, tolerating legacy rows mixed with newer formats."""
     if not path.exists():
         return pd.DataFrame(columns=CANONICAL_TRADE_FIELDS)
 
@@ -71,15 +97,9 @@ def read_trade_log(path: Path) -> pd.DataFrame:
         reader = csv.reader(f)
         next(reader, None)  # skip header (may be stale)
         for row in reader:
-            if len(row) == len(CANONICAL_TRADE_FIELDS):
-                rec = dict(zip(CANONICAL_TRADE_FIELDS, row))
-            elif len(row) == len(LEGACY_TRADE_FIELDS):
-                rec = dict(zip(LEGACY_TRADE_FIELDS, row))
-                rec["p_spike_raw"] = rec["p_spike"]
-                rec["p_spike_trade"] = rec["p_spike"]
-            else:
-                continue
-            rows.append(rec)
+            rec = _normalize_trade_row(row)
+            if rec:
+                rows.append(rec)
 
     if not rows:
         return pd.DataFrame(columns=CANONICAL_TRADE_FIELDS)
@@ -139,6 +159,9 @@ class AlpacaClient:
 
     def get_orders(self, status="open"):
         return self._request("GET", f"/v2/orders?status={status}&limit=100")
+
+    def get_order(self, order_id: str):
+        return self._request("GET", f"/v2/orders/{order_id}")
 
     def place_bracket_order(self, ticker, side, qty, take_profit_price, stop_loss_price,
                             limit_price=None):
@@ -248,6 +271,9 @@ def log_trades(trades, label: str = "open"):
     for col in ("p_spike_raw", "p_spike_trade"):
         if col not in new_df.columns:
             new_df[col] = new_df["p_spike"]
+    for col in ("order_status", "filled_qty"):
+        if col not in new_df.columns:
+            new_df[col] = ""
     new_df = new_df.reindex(columns=CANONICAL_TRADE_FIELDS)
     write_trade_log(path, pd.concat([existing, new_df], ignore_index=True))
 
@@ -497,34 +523,46 @@ def execute_trades(signals, client, dry_run=False):
         else:
             price = 100.0  # Placeholder for dry run
 
-        # Limit-entry price: only fill if the market moves favorably by
-        # LIMIT_ENTRY_DIP_PCT off the current quote. LONG = dip below current,
-        # SHORT = rip above current. Bracket TP/SL anchor to the limit price
-        # (the planned fill), not the current quote.
-        if direction == "LONG":
-            limit_price = round(price * (1 - LIMIT_ENTRY_DIP_PCT), 2)
-            take_profit_price = round(limit_price * (1 + TAKE_PROFIT_PCT), 2)
-            stop_loss_price = round(limit_price * (1 - STOP_LOSS_PCT), 2)
-        else:  # SHORT
-            limit_price = round(price * (1 + LIMIT_ENTRY_DIP_PCT), 2)
-            take_profit_price = round(limit_price * (1 - TAKE_PROFIT_PCT), 2)
-            stop_loss_price = round(limit_price * (1 + STOP_LOSS_PCT), 2)
-
-        # Size off the planned limit price, not the current quote.
-        qty = int(max_position_value / limit_price)
+        # Entry: market bracket (default) or limit-dip day order.
+        use_market_entry = ENTRY_ORDER_TYPE == "market"
+        if use_market_entry:
+            entry_ref = price
+            if direction == "LONG":
+                take_profit_price = round(entry_ref * (1 + TAKE_PROFIT_PCT), 2)
+                stop_loss_price = round(entry_ref * (1 - STOP_LOSS_PCT), 2)
+            else:
+                take_profit_price = round(entry_ref * (1 - TAKE_PROFIT_PCT), 2)
+                stop_loss_price = round(entry_ref * (1 + STOP_LOSS_PCT), 2)
+            limit_price = None
+            qty = int(max_position_value / entry_ref)
+        else:
+            if direction == "LONG":
+                limit_price = round(price * (1 - LIMIT_ENTRY_DIP_PCT), 2)
+                take_profit_price = round(limit_price * (1 + TAKE_PROFIT_PCT), 2)
+                stop_loss_price = round(limit_price * (1 - STOP_LOSS_PCT), 2)
+            else:  # SHORT
+                limit_price = round(price * (1 + LIMIT_ENTRY_DIP_PCT), 2)
+                take_profit_price = round(limit_price * (1 - TAKE_PROFIT_PCT), 2)
+                stop_loss_price = round(limit_price * (1 + STOP_LOSS_PCT), 2)
+            entry_ref = limit_price
+            qty = int(max_position_value / limit_price)
         if qty < 1:
-            print(f"    ⚠ {ticker} price ${limit_price:.2f} too high for position size ${max_position_value:.0f}. Skipping.")
+            print(f"    ⚠ {ticker} price ${entry_ref:.2f} too high for position size ${max_position_value:.0f}. Skipping.")
             continue
 
-        trade_value = qty * limit_price
+        trade_value = qty * entry_ref
 
         if dry_run:
-            print(f"    🏷️  {ticker:6s} {direction:5s}  {qty:4d} shares @ limit ${limit_price:.2f}"
+            entry_label = "market" if use_market_entry else f"limit ${limit_price:.2f}"
+            print(f"    🏷️  {ticker:6s} {direction:5s}  {qty:4d} shares @ {entry_label}"
                   f"  (ref ${price:.2f}, ${trade_value:,.0f})  TP=${take_profit_price:.2f}  SL=${stop_loss_price:.2f}"
                   f"  P(spike)={sig['p_spike']*100:.0f}%")
             order_id = "DRY-RUN"
+            order_status = "dry-run"
+            filled_qty = 0
         else:
-            print(f"    📤 {ticker:6s} {direction:5s}  {qty:4d} shares @ limit ${limit_price:.2f}"
+            entry_label = "market" if use_market_entry else f"limit ${limit_price:.2f}"
+            print(f"    📤 {ticker:6s} {direction:5s}  {qty:4d} shares @ {entry_label}"
                   f"  (ref ${price:.2f})  TP=${take_profit_price:.2f}  SL=${stop_loss_price:.2f}"
                   f"  P(spike)={sig['p_spike']*100:.0f}%", end=" ", flush=True)
 
@@ -534,7 +572,20 @@ def execute_trades(signals, client, dry_run=False):
             )
             if result:
                 order_id = result.get("id", "unknown")
-                print(f"✅ (order {order_id[:8]})")
+                order_status = result.get("status", "submitted")
+                filled_qty = int(float(result.get("filled_qty", 0) or 0))
+                # Brief poll — market entries often fill immediately during session.
+                import time
+                for _ in range(5):
+                    if filled_qty >= qty or order_status in {"filled", "canceled", "expired", "rejected"}:
+                        break
+                    time.sleep(1)
+                    detail = client.get_order(order_id)
+                    if detail:
+                        order_status = detail.get("status", order_status)
+                        filled_qty = int(float(detail.get("filled_qty", 0) or 0))
+                fill_note = f"filled {filled_qty}/{qty}" if filled_qty else order_status
+                print(f"✅ ({order_id[:8]}, {fill_note})")
             else:
                 print("❌ FAILED")
                 continue
@@ -545,7 +596,7 @@ def execute_trades(signals, client, dry_run=False):
             "ticker": ticker,
             "direction": direction,
             "qty": qty,
-            "entry_price": limit_price,
+            "entry_price": round(entry_ref, 2),
             "take_profit": take_profit_price,
             "stop_loss": stop_loss_price,
             "p_spike": round(sig["p_spike"], 4),
@@ -554,6 +605,8 @@ def execute_trades(signals, client, dry_run=False):
             "p_dir": round(sig["p_dir"], 4),
             "order_id": order_id,
             "mode": "dry-run" if dry_run else ("paper" if client.paper else "live"),
+            "order_status": order_status,
+            "filled_qty": filled_qty,
         })
 
     return trade_records
@@ -581,6 +634,17 @@ def close_all_open_positions(client, dry_run=False, label: str = "open") -> list
     if result is None:
         print("  ❌ close_all_positions API call failed.")
         return []
+
+    import time
+    for _ in range(15):
+        remaining = client.get_positions() or []
+        if not remaining:
+            break
+        time.sleep(2)
+    remaining = client.get_positions() or []
+    if remaining:
+        syms = ", ".join(p["symbol"] for p in remaining)
+        print(f"  ⚠ Still holding after close: {syms}")
 
     now = datetime.now(ET)
     records = []
@@ -690,6 +754,16 @@ def main():
         print(f"    Positions: {len(positions)}")
         for p in positions:
             print(f"      {p['symbol']}: {p['qty']} @ ${float(p['avg_entry_price']):.2f}")
+        open_orders = client.get_orders(status="open") or []
+        print(f"    Open orders: {len(open_orders)}")
+        for o in open_orders[:5]:
+            print(f"      {o['symbol']} {o['side']} {o['type']} {o['status']} qty={o['qty']}")
+        recent = client.get_orders(status="all") or []
+        if recent:
+            print(f"\n    Recent orders (paper dashboard: app.alpaca.markets/paper):")
+            for o in recent[:5]:
+                print(f"      {o.get('submitted_at','')[:16]} {o['symbol']:6} {o['side']:4} "
+                      f"{o['status']:10} filled={o.get('filled_qty','0')}/{o.get('qty','?')}")
         print("═" * 65)
         return
 
@@ -736,11 +810,16 @@ def main():
         print(f"\n  📄 {len(trade_records)} trades logged to {trade_log_path(label)}")
 
     # Step 5: Summary
+    filled = sum(int(t.get("filled_qty") or 0) for t in trade_records)
     print(f"\n  {'=' * 60}")
-    print(f"  SUMMARY: {len(trade_records)} orders {'simulated' if mode == 'dry-run' else 'placed'}")
+    print(f"  SUMMARY: {len(trade_records)} orders {'simulated' if mode == 'dry-run' else 'submitted'}"
+          + (f", {filled} shares filled" if not mode == "dry-run" else ""))
     for t in trade_records:
+        status = t.get("order_status", "")
+        fill = t.get("filled_qty", "")
+        extra = f"  [{status}, filled {fill}/{t['qty']}]" if status and mode != "dry-run" else ""
         print(f"    {t['ticker']:6s} {t['direction']:5s}  {t['qty']:4d} shares"
-              f"  TP=${t['take_profit']:.2f}  SL=${t['stop_loss']:.2f}")
+              f"  TP=${t['take_profit']:.2f}  SL=${t['stop_loss']:.2f}{extra}")
     print(f"  {'=' * 60}\n")
 
 

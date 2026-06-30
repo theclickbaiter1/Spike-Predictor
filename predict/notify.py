@@ -245,20 +245,33 @@ def format_trade_summary(csv_path: str = None, label: str = "open") -> str:
         return f"*Spike Trader [{tag}] — {today}*\n\n📭 No trades placed today."
 
     lines = [f"*Spike Trader [{tag}] — {today}*\n"]
-    lines.append(f"📊 *{len(df_today)} orders placed*\n")
+    filled = 0
+    for _, t in df_today.iterrows():
+        fq = t.get("filled_qty", "")
+        if str(fq).isdigit():
+            filled += int(fq)
+    lines.append(f"📊 *{len(df_today)} orders submitted*" +
+                 (f", *{filled} shares filled*" if filled else "") + "\n")
 
     for _, t in df_today.iterrows():
         d = "▲" if t["direction"] == "LONG" else "▼"
         p_disp = t.get("p_spike_trade", t["p_spike"])
+        status = t.get("order_status", "")
+        fq = t.get("filled_qty", "")
+        status_note = f" — {status}" if status else ""
+        if str(fq).isdigit() and int(fq) > 0:
+            status_note = f" — filled {fq}/{t['qty']}"
+        elif status in {"expired", "canceled"}:
+            status_note = f" — ⚠ {status} (no fill)"
         lines.append(
             f"  `{t['ticker']:<6}` {d} {t['direction']}  "
-            f"{t['qty']} shares @ ${float(t['entry_price']):.2f}\n"
+            f"{t['qty']} shares @ ${float(t['entry_price']):.2f}{status_note}\n"
             f"        TP=${float(t['take_profit']):.2f}  SL=${float(t['stop_loss']):.2f}  "
             f"P(spike)={float(p_disp)*100:.0f}%"
         )
 
     mode = df_today.iloc[0].get("mode", "unknown")
-    lines.append(f"\n_Mode: {mode}_")
+    lines.append(f"\n_Mode: {mode} (Alpaca paper dashboard)_")
 
     return "\n".join(lines)
 

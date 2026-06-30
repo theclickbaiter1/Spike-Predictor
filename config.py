@@ -58,6 +58,9 @@ MAX_CONSECUTIVE_TICKER_DAYS = 3  # Don't trade same ticker >3 days in a row
 # no fill by 4pm Alpaca cancels. Tradeoff: cleaner average entry price,
 # but you skip days that gap-and-run without a pullback.
 LIMIT_ENTRY_DIP_PCT = 0.005      # 0.5% favorable move required to fill
+# "market" = bracket with market entry (fills at open/intraday quote).
+# "limit_dip" = day limit entry LIMIT_ENTRY_DIP_PCT away (often expires unfilled).
+ENTRY_ORDER_TYPE = "market"
 
 # ── Ticker Universe (~58 tickers) ────────────────────────────────────────────
 UNIVERSE = [
