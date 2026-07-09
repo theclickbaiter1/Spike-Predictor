@@ -362,7 +362,8 @@ class TwoStageModel:
         # Magnitude head is independent of calibrator/Ising — always keep raw estimates.
         out["expected_abs_return"] = raw["expected_abs_return"]
         out["expected_signed_return"] = raw["expected_signed_return"]
-        out["expected_value"] = out["p_spike_trade"] * raw["expected_signed_return"]
+        # Gross expected move; trading code applies EV_COST_BUFFER via expected_edge().
+        out["expected_gross"] = out["p_spike_trade"] * raw["expected_signed_return"]
         return out
 
     def trade_val_metrics(self, X_val, y_val, threshold=None):

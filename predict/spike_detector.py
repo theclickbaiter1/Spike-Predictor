@@ -451,6 +451,7 @@ def run_predict():
     )
     from model import TwoStageModel
     from news import FinBERTScorer, FinnhubClient
+    from predict.trade import expected_edge
 
     print_banner()
     print("  MODE: PREDICT\n")
@@ -517,7 +518,7 @@ def run_predict():
             "p_spike_trade": r.get("p_spike_trade", r["p_spike"]),
             "expected_abs_return": float(r.get("expected_abs_return", 0) or 0),
             "expected_signed_return": float(r.get("expected_signed_return", 0) or 0),
-            "expected_value": float(r.get("expected_value", 0) or 0),
+            "expected_value": expected_edge(r),
             "p_up": r["p_up"],
             "p_down": r["p_down"],
             "p_flat": r["p_flat"],

@@ -298,12 +298,6 @@ def main():
     if "delayed_equity" in today_metrics:
         print(f"  Alpaca DELAYED: ${today_metrics['delayed_equity']:,.0f}  "
               f"day P&L ${today_metrics.get('delayed_daily_pnl', 0):+,.0f}")
-    if "open_equity" in today_metrics:
-        print(f"\n  Alpaca OPEN:    ${today_metrics['open_equity']:,.0f}  "
-              f"day P&L ${today_metrics.get('open_daily_pnl', 0):+,.0f}")
-    if "delayed_equity" in today_metrics:
-        print(f"  Alpaca DELAYED: ${today_metrics['delayed_equity']:,.0f}  "
-              f"day P&L ${today_metrics.get('delayed_daily_pnl', 0):+,.0f}")
 
     alert = rolling_precision_alert(metrics_df)
     if alert:

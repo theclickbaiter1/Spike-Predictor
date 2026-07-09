@@ -474,10 +474,8 @@ def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
             gap_agree = r.get("gap_sentiment_agreement") if "gap_sentiment_agreement" in r.index else None
             if not passes_direction_gates(r, direction, coupling, gap_agree):
                 continue
-            if "expected_value" in r.index and pd.notna(r.get("expected_value")):
-                edge = float(r["expected_value"])
-            else:
-                edge = expected_edge(r)
+            # Always recompute net edge (watchlists may store gross EV from older runs).
+            edge = expected_edge(r)
             if ev_gate_active and edge < EV_MIN_EDGE:
                 continue
             signals.append({
