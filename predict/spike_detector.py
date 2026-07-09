@@ -195,7 +195,7 @@ def backup_current_model():
             shutil.copy2(src, backup_dir / src.name)
 
     base = Path(base)
-    for suffix in ["_calibrator.json", "_ising.json"]:
+    for suffix in ["_calibrator.json", "_ising.json", "_ret.json"]:
         extra = base.parent / f"{base.name}{suffix}"
         if extra.exists():
             shutil.copy2(extra, backup_dir / extra.name)
@@ -214,7 +214,7 @@ def restore_model_from_backup(backup_dir: Path):
     """Restore model files from a backup directory."""
     base = str(MODEL_PATH).replace(".json", "")
     model_name = Path(base).name
-    for suffix in ["_s1.json", "_s2.json", "_meta.json", "_calibrator.json", "_ising.json"]:
+    for suffix in ["_s1.json", "_s2.json", "_ret.json", "_meta.json", "_calibrator.json", "_ising.json"]:
         src = backup_dir / f"{model_name}{suffix}"
         dest = Path(f"{base}{suffix}")
         if src.exists():
@@ -230,9 +230,10 @@ def restore_model_from_backup(backup_dir: Path):
 # Retrain acceptance: reject new model if val F1 or calibrated NLL worsens vs backup
 RETRAIN_MIN_F1_DELTA = -0.03
 RETRAIN_MAX_NLL_DELTA = 0.05
-RETRAIN_MIN_TRADE_PRECISION = 0.20
+RETRAIN_MIN_TRADE_PRECISION = 0.30
 RETRAIN_MAX_SIGNALS_PER_DAY = 15
 RETRAIN_MAX_VAL_OOS_GAP = 0.20  # reject if val prec - nested OOS prec > 20pp
+RETRAIN_MIN_HOLDOUT_SIGNAL_PNL = 0.0  # mean signed return on holdout signals
 
 
 def _mini_oos_gate(model, X_val, y_val, threshold: float | None = None) -> tuple[bool, str]:
@@ -357,19 +358,27 @@ def run_retrain(backup=True, force=False):
         oos_msg = f"skipped (force={force}, migration={feature_migration})"
 
     nested_oos_prec, nested_gap = float("nan"), float("nan")
+    holdout_pnl = float("nan")
     overfit_ok = True
+    economic_ok = True
     if not force and not feature_migration:
         try:
             sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backtest"))
-            from walkforward_utils import quick_holdout_oos_precision
+            from walkforward_utils import quick_holdout_oos_precision, quick_holdout_signal_pnl
             holdout_df = pd.read_parquet(TRAINING_DATA_PATH)
             nested_oos_prec = quick_holdout_oos_precision(model, holdout_df, holdout_frac=0.05)
+            holdout_pnl = quick_holdout_signal_pnl(model, holdout_df, holdout_frac=0.05)
             val_trade_prec = trade_val["precision"]
             if not np.isnan(nested_oos_prec):
                 gap = val_trade_prec - nested_oos_prec
                 if gap > RETRAIN_MAX_VAL_OOS_GAP:
                     overfit_ok = False
                 print(f"  Holdout OOS prec (5%): {nested_oos_prec:.2f}, val→OOS gap: {gap:+.2f}")
+            if not np.isnan(holdout_pnl) and holdout_pnl < RETRAIN_MIN_HOLDOUT_SIGNAL_PNL:
+                economic_ok = False
+                print(f"  🛑 Holdout signal P&L {holdout_pnl:+.4f} < {RETRAIN_MIN_HOLDOUT_SIGNAL_PNL:+.4f}")
+            elif not np.isnan(holdout_pnl):
+                print(f"  Holdout signal P&L proxy: {holdout_pnl:+.4f}")
         except Exception as e:
             print(f"  ⚠ Holdout OOS check skipped: {e}")
     else:
@@ -399,15 +408,20 @@ def run_retrain(backup=True, force=False):
         if not overfit_ok:
             print(f"  🛑 RETRAIN REJECTED — val/OOS overfit gap > {RETRAIN_MAX_VAL_OOS_GAP:.0%}")
             reject = True
+        if not economic_ok:
+            print("  🛑 RETRAIN REJECTED — holdout signal P&L below floor")
+            reject = True
         if reject:
             restore_model_from_backup(backup_dir)
             sys.exit(1)
         print(f"  ✅ Acceptance gate passed (F1 delta {f1_delta:+.3f})")
-    elif (not oos_ok or not overfit_ok) and not force:
+    elif (not oos_ok or not overfit_ok or not economic_ok) and not force:
         if not oos_ok:
             print(f"  🛑 RETRAIN REJECTED — {oos_msg}")
         if not overfit_ok:
             print(f"  🛑 RETRAIN REJECTED — val/OOS overfit gap > {RETRAIN_MAX_VAL_OOS_GAP:.0%}")
+        if not economic_ok:
+            print("  🛑 RETRAIN REJECTED — holdout signal P&L below floor")
         if backup_dir is not None:
             restore_model_from_backup(backup_dir)
         sys.exit(1)
@@ -424,7 +438,7 @@ def run_retrain(backup=True, force=False):
     print("\n  Tuning trade threshold (walk-forward)...")
     import subprocess
     tune_script = Path(__file__).resolve().parent.parent / "backtest" / "tune_threshold.py"
-    subprocess.run([sys.executable, str(tune_script)], check=False)
+    subprocess.run([sys.executable, str(tune_script), "--nested"], check=False)
 
     print("\n  ✅ Retraining complete.")
     print("═" * 65)
@@ -501,11 +515,17 @@ def run_predict():
             "p_spike": r["p_spike"],
             "p_spike_raw": r.get("p_spike_raw", r["p_spike"]),
             "p_spike_trade": r.get("p_spike_trade", r["p_spike"]),
+            "expected_abs_return": float(r.get("expected_abs_return", 0) or 0),
+            "expected_signed_return": float(r.get("expected_signed_return", 0) or 0),
+            "expected_value": float(r.get("expected_value", 0) or 0),
             "p_up": r["p_up"],
             "p_down": r["p_down"],
             "p_flat": r["p_flat"],
             "calibrator_bypassed": bool(r.get("calibrator_bypassed", False)),
             "coupling_alignment": row.get("coupling_alignment", 0),
+            "gap_sentiment_agreement": row.get("gap_sentiment_agreement", 0),
+            "days_to_earnings": row.get("days_to_earnings", 99),
+            "is_earnings_day": row.get("is_earnings_day", 0),
             "top_signal": determine_top_signal(row),
         })
 
@@ -513,11 +533,13 @@ def run_predict():
         print("\n  📭 No valid predictions (missing market data). Saving empty watchlist.")
         results_df = pd.DataFrame(columns=[
             "ticker", "p_spike", "p_spike_raw", "p_spike_trade",
+            "expected_abs_return", "expected_signed_return", "expected_value",
             "p_up", "p_down", "p_flat", "calibrator_bypassed",
             "coupling_alignment", "top_signal",
         ])
     else:
         results_df = pd.DataFrame(results).sort_values("p_spike_trade", ascending=False)
+        results_df["vix"] = macro_cache.get("vix")
         results_df["tier"] = "flat"
         trade_t = get_trade_threshold(
             float(macro_cache.get("vix", 0)) if macro_cache.get("vix") is not None else None

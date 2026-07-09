@@ -45,6 +45,7 @@ jobs:
           path: |
             data/model_s1.json
             data/model_s2.json
+            data/model_ret.json
             data/model_meta.json
             data/model_calibrator.json
             data/model_ising.json

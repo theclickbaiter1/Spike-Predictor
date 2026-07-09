@@ -84,7 +84,9 @@ def classify_intraday_return(ret: float, threshold: float = None) -> str:
 OPTIONAL_FILL_COLS = [
     "eps_surprise_last", "revenue_surprise_last", "earnings_streak",
     "post_earnings_drift_1d", "earnings_volatility",
-    "premarket_gap_pct", "premarket_volume_ratio", "gap_sentiment_agreement",
+    "premarket_gap_pct", "premarket_volume_ratio",
+    "premarket_session_range_pct", "premarket_session_rel_volume",
+    "gap_sentiment_agreement",
     "earnings_catalyst_score",
     "vix_change_3d", "vix_change_5d", "vix_regime",
     "dxy_change_5d", "crude_oil_change_5d", "gold_change_5d",
@@ -155,6 +157,15 @@ def compute_technical_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     vol_mean = vol_20d.rolling(60, min_periods=20).mean().shift(1)
     vol_std = vol_20d.rolling(60, min_periods=20).std().shift(1)
     f["vol_z_score"] = ((vol_20d.shift(1) - vol_mean) / vol_std.replace(0, np.nan))
+    f["ret_1d"] = close.pct_change().shift(1)
+    f["ret_5d"] = close.pct_change(5).shift(1)
+    f["ret_10d"] = close.pct_change(10).shift(1)
+    # Approximate sequence dynamics for tabular model without lookahead.
+    f["momentum_slope_5d"] = (
+        close.pct_change().rolling(5, min_periods=3).mean().shift(1)
+        - close.pct_change().rolling(20, min_periods=10).mean().shift(1)
+    )
+    f["vol_regime_shift"] = (vol_20d.shift(1) - vol_20d.shift(6))
     return f
 
 
@@ -175,6 +186,11 @@ def compute_catalyst_features(
     f["premarket_gap_pct"] = (open_ - prev_close) / prev_close.replace(0, np.nan)
     avg_vol = volume.rolling(10, min_periods=5).mean().shift(1)
     f["premarket_volume_ratio"] = (volume.shift(1) / avg_vol.replace(0, np.nan)).fillna(0)
+    # Training proxy for premarket tape (open vs prior close); live uses Alpaca session bars.
+    f["premarket_session_range_pct"] = (
+        (open_ - prev_close).abs() / prev_close.replace(0, np.nan)
+    ).fillna(0)
+    f["premarket_session_rel_volume"] = f["premarket_volume_ratio"]
 
     if sentiment_mean is not None:
         sent = sentiment_mean.reindex(ohlcv.index).fillna(0)
@@ -194,6 +210,59 @@ def compute_catalyst_features(
         f["earnings_catalyst_score"] = 0.0
 
     return f
+
+
+def fetch_alpaca_premarket_session(ticker: str) -> dict:
+    """
+    Fetch premarket session stats from Alpaca 1-min bars (04:00–09:30 ET).
+    Returns empty dict when unavailable.
+    """
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return {}
+    try:
+        import requests
+        from zoneinfo import ZoneInfo
+
+        et = ZoneInfo("America/New_York")
+        now = datetime.now(et)
+        start = now.replace(hour=4, minute=0, second=0, microsecond=0)
+        if now < start:
+            return {}
+        url = "https://data.alpaca.markets/v2/stocks/bars"
+        params = {
+            "symbols": ticker,
+            "timeframe": "1Min",
+            "start": start.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "end": now.astimezone(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "limit": 10000,
+            "feed": "iex",
+        }
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=12)
+        if not resp.ok:
+            return {}
+        bars = (resp.json().get("bars") or {}).get(ticker) or []
+        if len(bars) < 2:
+            return {}
+        highs = [float(b["h"]) for b in bars]
+        lows = [float(b["l"]) for b in bars]
+        closes = [float(b["c"]) for b in bars]
+        vols = [float(b["v"]) for b in bars]
+        last_px = closes[-1]
+        session_high, session_low = max(highs), min(lows)
+        mid = (session_high + session_low) / 2 if (session_high + session_low) > 0 else last_px
+        return {
+            "last_price": last_px,
+            "session_high": session_high,
+            "session_low": session_low,
+            "session_volume": float(sum(vols)),
+            "session_range_pct": (session_high - session_low) / mid if mid > 0 else 0.0,
+        }
+    except Exception:
+        return {}
 
 
 def fetch_live_premarket_price(ticker: str) -> float | None:
@@ -217,13 +286,20 @@ def fetch_live_premarket_price(ticker: str) -> float | None:
 
 
 def apply_live_premarket_overrides(row: dict, ticker: str, ohlcv: pd.DataFrame) -> dict:
-    """Override premarket_gap_pct with live price when available before the open."""
+    """Override catalyst features with live Alpaca premarket session data before the open."""
     if ohlcv.empty:
         return row
     prev_close = float(ohlcv["Close"].iloc[-2]) if len(ohlcv) >= 2 else float(ohlcv["Close"].iloc[-1])
-    live_px = fetch_live_premarket_price(ticker)
+    session = fetch_alpaca_premarket_session(ticker)
+    live_px = session.get("last_price") or fetch_live_premarket_price(ticker)
     if live_px and prev_close > 0:
         row["premarket_gap_pct"] = (live_px - prev_close) / prev_close
+        if session:
+            row["premarket_session_range_pct"] = float(session.get("session_range_pct", 0) or 0)
+            avg_vol = float(row.get("avg_volume_10d", 0) or 0)
+            if avg_vol > 0 and session.get("session_volume"):
+                # Scale minute volume to full-day equivalent for ratio comparison.
+                row["premarket_session_rel_volume"] = float(session["session_volume"]) / (avg_vol / 390.0)
         sent = row.get("overnight_sentiment_mean", 0) or 0
         gap = row["premarket_gap_pct"]
         if abs(gap) > 0.002 and abs(sent) > 0.1 and np.sign(gap) == np.sign(sent):
@@ -244,6 +320,12 @@ def _download_safe(ticker: str, start: str, end: str, retries: int = 3) -> pd.Da
     end_ts = pd.Timestamp(end)
     if end_ts <= start_ts:
         end_ts = start_ts + pd.Timedelta(days=1)
+
+    # Prefer Alpaca bars when credentials are available (better split/dividend handling
+    # and more stable than yfinance for production workflows).
+    alpaca = _download_alpaca_bars(ticker, start_ts, end_ts)
+    if not alpaca.empty:
+        return alpaca
 
     for attempt in range(retries):
         try:
@@ -276,6 +358,50 @@ def _download_safe(ticker: str, start: str, end: str, retries: int = 3) -> pd.Da
         time.sleep(0.35 * (attempt + 1))
 
     return pd.DataFrame()
+
+
+def _download_alpaca_bars(ticker: str, start_ts: pd.Timestamp, end_ts: pd.Timestamp) -> pd.DataFrame:
+    """Fetch daily bars from Alpaca market data API; returns empty on failure."""
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        return pd.DataFrame()
+    try:
+        import requests
+
+        url = "https://data.alpaca.markets/v2/stocks/bars"
+        params = {
+            "symbols": ticker,
+            "timeframe": "1Day",
+            "start": start_ts.strftime("%Y-%m-%dT00:00:00Z"),
+            "end": end_ts.strftime("%Y-%m-%dT00:00:00Z"),
+            "adjustment": "all",
+            "limit": 10000,
+            "feed": "iex",
+        }
+        headers = {
+            "APCA-API-KEY-ID": ALPACA_API_KEY,
+            "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
+        }
+        resp = requests.get(url, params=params, headers=headers, timeout=12)
+        if not resp.ok:
+            return pd.DataFrame()
+        bars = (resp.json().get("bars") or {}).get(ticker) or []
+        if not bars:
+            return pd.DataFrame()
+        df = pd.DataFrame(bars)
+        df["t"] = pd.to_datetime(df["t"]).dt.tz_convert(None).dt.normalize()
+        out = pd.DataFrame(
+            {
+                "Open": df["o"].astype(float),
+                "High": df["h"].astype(float),
+                "Low": df["l"].astype(float),
+                "Close": df["c"].astype(float),
+                "Volume": df["v"].astype(float),
+            },
+            index=df["t"],
+        ).sort_index()
+        return out
+    except Exception:
+        return pd.DataFrame()
 
 
 def compute_macro_features(trading_dates, start_date, end_date):

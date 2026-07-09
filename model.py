@@ -19,7 +19,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 
 from config import (
     FEATURE_COLUMNS, MODEL_PATH, SPIKE_THRESHOLD, UNIVERSE,
-    VAL_FRACTION, XGB_PARAMS_S1, XGB_PARAMS_S2,
+    VAL_FRACTION, XGB_PARAMS_RET, XGB_PARAMS_S1, XGB_PARAMS_S2,
     S1_POS_WEIGHT_MULTIPLIER, get_trade_threshold,
 )
 from stat_mech.calibrator import BoltzmannCalibrator
@@ -75,8 +75,10 @@ class TwoStageModel:
     def __init__(self):
         self.spike_model = None
         self.direction_model = None
+        self.return_model = None
         self.best_rounds_s1 = 500
         self.best_rounds_s2 = 300
+        self.best_rounds_ret = 300
         self.calibrator = BoltzmannCalibrator()
         self.ising = IsingOverlay()
 
@@ -162,6 +164,27 @@ class TwoStageModel:
         else:
             print(f"    Direction accuracy: N/A (only {spike_val.sum()} spike samples in val)")
 
+        # ── Stage 3: Spike magnitude regressor ─────────────────────────────
+        print("\n  ▶ Stage 3: Spike Magnitude Regressor (|intraday return|)")
+        if ret_train is None or ret_val is None:
+            print("    ⚠ Missing return labels. Skipping Stage 3.")
+            return self.best_rounds_s1, self.best_rounds_s2
+        abs_ret_train = ret_train.abs()
+        abs_ret_val = ret_val.abs()
+        params_ret = XGB_PARAMS_RET.copy()
+        es_ret = params_ret.pop("early_stopping_rounds", 30)
+        self.return_model = xgb.XGBRegressor(**params_ret, early_stopping_rounds=es_ret)
+        self.return_model.fit(
+            X_train,
+            abs_ret_train,
+            eval_set=[(X_val, abs_ret_val)],
+            verbose=False,
+        )
+        self.best_rounds_ret = self.return_model.best_iteration + 1
+        val_pred = self.return_model.predict(X_val)
+        mae = np.mean(np.abs(val_pred - abs_ret_val.values))
+        print(f"    Best iteration: {self.best_rounds_ret}")
+        print(f"    Magnitude MAE: {mae:.4f}")
         return self.best_rounds_s1, self.best_rounds_s2
 
     def fit_stat_mech_layers(self, X_val, y_val, sign_returns: pd.DataFrame,
@@ -218,6 +241,14 @@ class TwoStageModel:
         self.direction_model = xgb.XGBClassifier(**params2)
         self.direction_model.fit(X_s2, y_s2, verbose=False)
 
+        # Stage 3: return magnitude regression
+        if intraday_ret is not None:
+            params_ret = XGB_PARAMS_RET.copy()
+            params_ret.pop("early_stopping_rounds", None)
+            params_ret["n_estimators"] = self.best_rounds_ret
+            self.return_model = xgb.XGBRegressor(**params_ret)
+            self.return_model.fit(X, intraday_ret.abs(), verbose=False)
+
         print("  Full retrain complete.")
 
     def spike_val_metrics(self, X_val, y_val, threshold=0.5, calibrated=False):
@@ -248,20 +279,29 @@ class TwoStageModel:
         if isinstance(X, pd.DataFrame):
             X_s1 = _align_to_model_features(X, self.spike_model)
             X_s2 = _align_to_model_features(X, self.direction_model) if self.direction_model else X
+            X_ret = _align_to_model_features(X, self.return_model) if self.return_model else X
         else:
-            X_s1, X_s2 = X, X
+            X_s1, X_s2, X_ret = X, X, X
         p_spike = self.spike_model.predict_proba(X_s1)[:, 1]
 
         if self.direction_model is not None:
             p_up_given_spike = self.direction_model.predict_proba(X_s2)[:, 1]
         else:
             p_up_given_spike = np.full(len(X), 0.5)
+        if self.return_model is not None:
+            expected_abs = np.maximum(self.return_model.predict(X_ret), 0)
+        else:
+            expected_abs = np.zeros(len(X))
+        direction_bias = (2 * p_up_given_spike) - 1.0
+        expected_signed = expected_abs * direction_bias
 
         return pd.DataFrame({
             "p_spike": p_spike,
             "p_up": p_spike * p_up_given_spike,
             "p_down": p_spike * (1 - p_up_given_spike),
             "p_flat": 1 - p_spike,
+            "expected_abs_return": expected_abs,
+            "expected_signed_return": expected_signed,
         }, index=X.index if hasattr(X, "index") else None)
 
     def predict(self, X):
@@ -319,6 +359,10 @@ class TwoStageModel:
             out["calibrator_bypassed"] = False
 
         out["p_spike_trade"] = out["p_spike"]
+        # Magnitude head is independent of calibrator/Ising — always keep raw estimates.
+        out["expected_abs_return"] = raw["expected_abs_return"]
+        out["expected_signed_return"] = raw["expected_signed_return"]
+        out["expected_value"] = out["p_spike_trade"] * raw["expected_signed_return"]
         return out
 
     def trade_val_metrics(self, X_val, y_val, threshold=None):
@@ -340,7 +384,13 @@ class TwoStageModel:
         self.spike_model.save_model(f"{base}_s1.json")
         if self.direction_model:
             self.direction_model.save_model(f"{base}_s2.json")
-        meta = {"best_rounds_s1": self.best_rounds_s1, "best_rounds_s2": self.best_rounds_s2}
+        if self.return_model:
+            self.return_model.save_model(f"{base}_ret.json")
+        meta = {
+            "best_rounds_s1": self.best_rounds_s1,
+            "best_rounds_s2": self.best_rounds_s2,
+            "best_rounds_ret": self.best_rounds_ret,
+        }
         with open(f"{base}_meta.json", "w") as f:
             json.dump(meta, f)
         self.calibrator.save(Path(f"{base}_calibrator.json"))
@@ -355,12 +405,17 @@ class TwoStageModel:
         if Path(s2_path).exists():
             self.direction_model = xgb.XGBClassifier()
             self.direction_model.load_model(s2_path)
+        ret_path = f"{base}_ret.json"
+        if Path(ret_path).exists():
+            self.return_model = xgb.XGBRegressor()
+            self.return_model.load_model(ret_path)
         meta_path = f"{base}_meta.json"
         if Path(meta_path).exists():
             with open(meta_path) as f:
                 meta = json.load(f)
             self.best_rounds_s1 = meta.get("best_rounds_s1", 500)
             self.best_rounds_s2 = meta.get("best_rounds_s2", 300)
+            self.best_rounds_ret = meta.get("best_rounds_ret", 300)
         self.calibrator.load(Path(f"{base}_calibrator.json"))
         self.ising.load(Path(f"{base}_ising.json"))
         print(f"  Model loaded from {base}_s1.json")

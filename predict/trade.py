@@ -33,6 +33,10 @@ from config import (
     ALPACA_SECRET_KEY_DELAYED,
     DIRECTION_MARGIN_MIN,
     ENTRY_ORDER_TYPE,
+    EV_COST_BUFFER,
+    EV_MAX_POSITION_PCT,
+    EV_MIN_EDGE,
+    EV_POSITION_MULTIPLIER,
     FEATURE_COLUMNS,
     LIMIT_ENTRY_DIP_PCT,
     MAX_CONSECUTIVE_TICKER_DAYS,
@@ -41,7 +45,10 @@ from config import (
     MAX_POSITION_PCT,
     MODEL_PATH,
     OUTPUT_DIR,
+    REQUIRE_GAP_SENTIMENT_AGREEMENT,
     SECTOR_AGREEMENT_REQUIRED,
+    SKIP_TRADE_NEAR_EARNINGS_DAYS,
+    SKIP_TRADE_VIX_ABOVE,
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
     TRADE_LOG_PATH,
@@ -55,7 +62,7 @@ ET = ZoneInfo("America/New_York")
 CANONICAL_TRADE_FIELDS = [
     "date", "time", "ticker", "direction", "qty", "entry_price",
     "take_profit", "stop_loss", "p_spike", "p_spike_raw", "p_spike_trade", "p_dir",
-    "order_id", "mode", "order_status", "filled_qty",
+    "expected_value", "order_id", "mode", "order_status", "filled_qty",
 ]
 LEGACY_TRADE_FIELDS_V2 = [
     "date", "time", "ticker", "direction", "qty", "entry_price",
@@ -74,12 +81,14 @@ def _normalize_trade_row(row: list[str]) -> dict | None:
         rec = dict(zip(CANONICAL_TRADE_FIELDS, row))
     elif len(row) == len(LEGACY_TRADE_FIELDS_V2):
         rec = dict(zip(LEGACY_TRADE_FIELDS_V2, row))
+        rec["expected_value"] = ""
         rec["order_status"] = ""
         rec["filled_qty"] = ""
     elif len(row) == len(LEGACY_TRADE_FIELDS):
         rec = dict(zip(LEGACY_TRADE_FIELDS, row))
         rec["p_spike_raw"] = rec["p_spike"]
         rec["p_spike_trade"] = rec["p_spike"]
+        rec["expected_value"] = ""
         rec["order_status"] = ""
         rec["filled_qty"] = ""
     else:
@@ -280,8 +289,13 @@ def log_trades(trades, label: str = "open"):
 
 # ── Signal Generation ────────────────────────────────────────────────────────
 
-def passes_direction_gates(prob_row, direction: str, coupling_alignment: float) -> bool:
-    """Direction confidence + optional sector magnetization agreement."""
+def passes_direction_gates(
+    prob_row,
+    direction: str,
+    coupling_alignment: float,
+    gap_sentiment_agreement: float | None = None,
+) -> bool:
+    """Direction confidence + sector magnetization + gap/sentiment agreement."""
     p_spike = float(prob_row.get("p_spike_trade", prob_row["p_spike"]))
     if p_spike <= 0:
         return False
@@ -294,6 +308,21 @@ def passes_direction_gates(prob_row, direction: str, coupling_alignment: float) 
             return False
         if direction == "SHORT" and coupling > 0:
             return False
+    if REQUIRE_GAP_SENTIMENT_AGREEMENT and gap_sentiment_agreement is not None:
+        if float(gap_sentiment_agreement or 0) < 1:
+            return False
+    return True
+
+
+def passes_entry_filters(feature_row, vix: float | None) -> bool:
+    """Macro and calendar gates for new entries."""
+    if vix is not None and pd.notna(vix) and float(vix) >= SKIP_TRADE_VIX_ABOVE:
+        return False
+    days = feature_row.get("days_to_earnings", 99)
+    if days is not None and pd.notna(days) and int(days) <= SKIP_TRADE_NEAR_EARNINGS_DAYS:
+        return False
+    if int(feature_row.get("is_earnings_day", 0) or 0) == 1:
+        return False
     return True
 
 
@@ -306,6 +335,16 @@ def apply_top_signal_cap(signals: list[dict], max_pool: int) -> list[dict]:
     capped = [s for s in signals if s["p_spike_trade"] >= floor]
     print(f"    ⚠ Top-signal cap: {len(signals)} → {len(capped)} (floor P={floor*100:.1f}%)")
     return capped[:max_pool]
+
+
+def expected_edge(prob_row) -> float:
+    """
+    Expected net return per trade from model outputs.
+    Uses magnitude head if present; otherwise falls back to 0.
+    """
+    p_trade = float(prob_row.get("p_spike_trade", prob_row.get("p_spike", 0)))
+    signed = float(prob_row.get("expected_signed_return", 0) or 0)
+    return (p_trade * signed) - EV_COST_BUFFER
 
 
 def generate_signals():
@@ -361,6 +400,9 @@ def generate_signals():
 
     probs = model.predict_for_trade(X)
     vix = macro_cache.get("vix")
+    if vix is not None and pd.notna(vix) and float(vix) >= SKIP_TRADE_VIX_ABOVE:
+        print(f"\n  ⚠ VIX {float(vix):.1f} ≥ {SKIP_TRADE_VIX_ABOVE:.0f} — no new entries today.")
+        return []
     threshold = get_trade_threshold(float(vix) if vix is not None else None)
 
     # Build signal list
@@ -370,9 +412,16 @@ def generate_signals():
         p_trade = float(r.get("p_spike_trade", r["p_spike"]))
         if p_trade < threshold:
             continue
+        row = feature_rows[ticker]
+        if not passes_entry_filters(row, vix):
+            continue
         direction = "LONG" if r["p_up"] > r["p_down"] else "SHORT"
-        coupling = float(feature_rows[ticker].get("coupling_alignment", 0) or 0)
-        if not passes_direction_gates(r, direction, coupling):
+        coupling = float(row.get("coupling_alignment", 0) or 0)
+        gap_agree = row.get("gap_sentiment_agreement")
+        if not passes_direction_gates(r, direction, coupling, gap_agree):
+            continue
+        edge = expected_edge(r)
+        if model.return_model is not None and edge < EV_MIN_EDGE:
             continue
         p_dir = max(r["p_up"], r["p_down"])
         signals.append({
@@ -383,6 +432,8 @@ def generate_signals():
             "p_spike_trade": p_trade,
             "p_dir": float(p_dir),
             "coupling_alignment": coupling,
+            "expected_signed_return": float(r.get("expected_signed_return", 0) or 0),
+            "expected_value": edge,
         })
 
     signals = apply_top_signal_cap(signals, MAX_POSITIONS_PER_DAY * 4)
@@ -404,15 +455,30 @@ def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
 
     df = pd.read_csv(csv_path)
     vix = df["vix"].iloc[0] if "vix" in df.columns and len(df) else None
+    if vix is not None and pd.notna(vix) and float(vix) >= SKIP_TRADE_VIX_ABOVE:
+        print(f"  ⚠ VIX {float(vix):.1f} ≥ {SKIP_TRADE_VIX_ABOVE:.0f} — no new entries from watchlist.")
+        return []
     threshold = get_trade_threshold(float(vix) if vix is not None and pd.notna(vix) else None)
     prob_col = TRADE_PROB_COLUMN if TRADE_PROB_COLUMN in df.columns else "p_spike"
+    ev_gate_active = "expected_signed_return" in df.columns
+    if not ev_gate_active:
+        print("  ℹ Watchlist has no magnitude columns — EV gate skipped (retrain for EV sizing).")
     signals = []
     for _, r in df.iterrows():
         p_trade = float(r.get(prob_col, r["p_spike"]))
         if p_trade >= threshold:
+            if not passes_entry_filters(r, vix):
+                continue
             direction = "LONG" if r["p_up"] > r["p_down"] else "SHORT"
             coupling = float(r.get("coupling_alignment", 0) or 0)
-            if not passes_direction_gates(r, direction, coupling):
+            gap_agree = r.get("gap_sentiment_agreement") if "gap_sentiment_agreement" in r.index else None
+            if not passes_direction_gates(r, direction, coupling, gap_agree):
+                continue
+            if "expected_value" in r.index and pd.notna(r.get("expected_value")):
+                edge = float(r["expected_value"])
+            else:
+                edge = expected_edge(r)
+            if ev_gate_active and edge < EV_MIN_EDGE:
                 continue
             signals.append({
                 "ticker": r["ticker"],
@@ -421,6 +487,8 @@ def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
                 "p_spike_raw": float(r.get("p_spike_raw", r["p_spike"])),
                 "p_spike_trade": p_trade,
                 "p_dir": float(max(r["p_up"], r["p_down"])),
+                "expected_signed_return": float(r.get("expected_signed_return", 0) or 0),
+                "expected_value": edge,
             })
     signals = apply_top_signal_cap(signals, MAX_POSITIONS_PER_DAY * 4)
     signals.sort(key=lambda s: s["p_spike_trade"], reverse=True)
@@ -513,6 +581,9 @@ def execute_trades(signals, client, dry_run=False):
         ticker = sig["ticker"]
         direction = sig["direction"]
         side = "buy" if direction == "LONG" else "sell"
+        edge = float(sig.get("expected_value", 0) or 0)
+        ev_size_frac = min(EV_MAX_POSITION_PCT, max(0.0, edge * EV_POSITION_MULTIPLIER))
+        position_value = max_position_value if ev_size_frac <= 0 else (equity * ev_size_frac)
 
         # Get current price for position sizing
         if not dry_run:
@@ -534,7 +605,7 @@ def execute_trades(signals, client, dry_run=False):
                 take_profit_price = round(entry_ref * (1 - TAKE_PROFIT_PCT), 2)
                 stop_loss_price = round(entry_ref * (1 + STOP_LOSS_PCT), 2)
             limit_price = None
-            qty = int(max_position_value / entry_ref)
+            qty = int(position_value / entry_ref)
         else:
             if direction == "LONG":
                 limit_price = round(price * (1 - LIMIT_ENTRY_DIP_PCT), 2)
@@ -545,9 +616,9 @@ def execute_trades(signals, client, dry_run=False):
                 take_profit_price = round(limit_price * (1 - TAKE_PROFIT_PCT), 2)
                 stop_loss_price = round(limit_price * (1 + STOP_LOSS_PCT), 2)
             entry_ref = limit_price
-            qty = int(max_position_value / limit_price)
+            qty = int(position_value / limit_price)
         if qty < 1:
-            print(f"    ⚠ {ticker} price ${entry_ref:.2f} too high for position size ${max_position_value:.0f}. Skipping.")
+            print(f"    ⚠ {ticker} price ${entry_ref:.2f} too high for position size ${position_value:.0f}. Skipping.")
             continue
 
         trade_value = qty * entry_ref
@@ -556,7 +627,7 @@ def execute_trades(signals, client, dry_run=False):
             entry_label = "market" if use_market_entry else f"limit ${limit_price:.2f}"
             print(f"    🏷️  {ticker:6s} {direction:5s}  {qty:4d} shares @ {entry_label}"
                   f"  (ref ${price:.2f}, ${trade_value:,.0f})  TP=${take_profit_price:.2f}  SL=${stop_loss_price:.2f}"
-                  f"  P(spike)={sig['p_spike']*100:.0f}%")
+                  f"  P(spike)={sig['p_spike']*100:.0f}% EV={edge*100:+.2f}%")
             order_id = "DRY-RUN"
             order_status = "dry-run"
             filled_qty = 0
@@ -564,7 +635,7 @@ def execute_trades(signals, client, dry_run=False):
             entry_label = "market" if use_market_entry else f"limit ${limit_price:.2f}"
             print(f"    📤 {ticker:6s} {direction:5s}  {qty:4d} shares @ {entry_label}"
                   f"  (ref ${price:.2f})  TP=${take_profit_price:.2f}  SL=${stop_loss_price:.2f}"
-                  f"  P(spike)={sig['p_spike']*100:.0f}%", end=" ", flush=True)
+                  f"  P(spike)={sig['p_spike']*100:.0f}% EV={edge*100:+.2f}%", end=" ", flush=True)
 
             result = client.place_bracket_order(
                 ticker, side, qty, take_profit_price, stop_loss_price,
@@ -603,6 +674,7 @@ def execute_trades(signals, client, dry_run=False):
             "p_spike_raw": round(sig.get("p_spike_raw", sig["p_spike"]), 4),
             "p_spike_trade": round(sig.get("p_spike_trade", sig["p_spike"]), 4),
             "p_dir": round(sig["p_dir"], 4),
+            "expected_value": round(edge, 5),
             "order_id": order_id,
             "mode": "dry-run" if dry_run else ("paper" if client.paper else "live"),
             "order_status": order_status,
@@ -784,7 +856,10 @@ def main():
     threshold = get_trade_threshold()
     print(f"\n  Found {len(signals)} signals above {threshold*100:.0f}% threshold:")
     for s in signals:
-        print(f"    {s['ticker']:6s} {s['direction']:5s}  P(trade)={s['p_spike_trade']*100:.1f}%")
+        print(
+            f"    {s['ticker']:6s} {s['direction']:5s}  "
+            f"P(trade)={s['p_spike_trade']*100:.1f}%  EV={float(s.get('expected_value', 0))*100:+.2f}%"
+        )
 
     # Step 2: Apply risk filters
     print(f"\n  Step 2: Applying risk filters...")

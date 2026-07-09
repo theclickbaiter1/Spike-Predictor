@@ -17,6 +17,8 @@ from sklearn.metrics import precision_score, recall_score
 from config import (
     FEATURE_COLUMNS,
     MAX_POSITIONS_PER_DAY,
+    MIN_TRADE_THRESHOLD,
+    MIN_TUNED_PRECISION,
     TRADE_THRESHOLD,
     TRAINING_DATA_PATH,
     TUNED_THRESHOLD_PATH,
@@ -25,7 +27,7 @@ from config import (
 from model import TwoStageModel, time_series_split
 from stat_mech.ising import sign_returns_from_training
 
-THRESHOLD_GRID = [0.45, 0.50, 0.55, 0.60, 0.65, 0.70, 0.75]
+THRESHOLD_GRID = [0.55, 0.60, 0.65, 0.70, 0.75, 0.80]
 MIN_RECALL = 0.25
 VIX_LOW_MAX = 15.0
 VIX_MID_MAX = 25.0
@@ -120,12 +122,15 @@ def pick_best_threshold(
         m = eval_probs_slice(model, X_tune, y_tune, t)
         if m["recall"] < MIN_RECALL:
             continue
+        if m["precision"] < MIN_TUNED_PRECISION:
+            continue
         if m["signals_per_day"] > MAX_POSITIONS_PER_DAY:
             continue
         if best is None or m["precision"] > best["precision"]:
             best = m
     if best is None:
-        best = eval_probs_slice(model, X_tune, y_tune, TRADE_THRESHOLD)
+        best = eval_probs_slice(model, X_tune, y_tune, max(TRADE_THRESHOLD, MIN_TRADE_THRESHOLD))
+    best["threshold"] = max(best["threshold"], MIN_TRADE_THRESHOLD)
     best["vix_mean"] = float(vix_series.mean()) if vix_series is not None and len(vix_series) else None
     return best
 
@@ -338,6 +343,40 @@ def quick_holdout_oos_precision(
     y_h = df.loc[mask, "_target"].astype(int)
     m = eval_probs_slice(model, X_h, y_h, threshold)
     return m["precision"]
+
+
+def quick_holdout_signal_pnl(
+    model: TwoStageModel,
+    df: pd.DataFrame,
+    holdout_frac: float = 0.05,
+    threshold: float | None = None,
+) -> float:
+    """Mean direction-aligned intraday return on trade signals in trailing holdout."""
+    if threshold is None:
+        from config import get_trade_threshold
+        threshold = get_trade_threshold()
+    dates = sorted(pd.Index(df.index).unique())
+    if len(dates) < 20:
+        return float("nan")
+    cut = max(0, int(len(dates) * (1 - holdout_frac)))
+    holdout = set(dates[cut:])
+    mask = df.index.isin(holdout)
+    if mask.sum() < 10 or "_intraday_return" not in df.columns:
+        return float("nan")
+    X_h = df.loc[mask, FEATURE_COLUMNS]
+    rets = df.loc[mask, "_intraday_return"]
+    probs = model.predict_for_trade(X_h)
+    signed = []
+    for idx in X_h.index:
+        r = probs.loc[idx]
+        p_trade = float(r.get("p_spike_trade", r["p_spike"]))
+        if p_trade < threshold:
+            continue
+        direction = 1 if r["p_up"] > r["p_down"] else -1
+        signed.append(float(rets.loc[idx]) * direction)
+    if not signed:
+        return float("nan")
+    return float(np.mean(signed))
 
 
 def quick_nested_oos_precision(n_folds: int = 2, tune_days: int = 20) -> tuple[float, float]:

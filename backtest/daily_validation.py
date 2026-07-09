@@ -1,7 +1,7 @@
 """
 daily_validation.py — Post-market validation of the morning's predictions.
 
-Runs after 4:00 PM ET. Reads today's watchlist (generated at 9:15 AM ET by
+Runs after 3:55 PM ET (before market close). Reads today's watchlist (generated at 9:15 AM ET by
 spike_detector.py), fetches actual intraday returns via yfinance, computes
 per-day metrics, and appends to a rolling history so trends are visible.
 
@@ -261,6 +261,11 @@ def main():
     today_metrics["trade_threshold"] = trade_threshold
     if vix_level is not None:
         today_metrics["vix"] = vix_level
+    try:
+        from predict.alpaca_pnl import both_accounts_summary
+        today_metrics.update(both_accounts_summary())
+    except Exception as e:
+        print(f"  ⚠ Alpaca P&L snapshot skipped: {e}")
     if METRICS_CSV.exists():
         metrics_df = pd.read_csv(METRICS_CSV)
         metrics_df = metrics_df[metrics_df["date"] != date_str]
@@ -287,6 +292,18 @@ def main():
         print(f"  Raw prec @ {trade_threshold:.2f}:   {today_metrics['p_spike_raw_precision']*100:5.1f}%")
     if "p_spike_trade_precision" in today_metrics:
         print(f"  Trade prec @ {trade_threshold:.2f}: {today_metrics['p_spike_trade_precision']*100:5.1f}%")
+    if "open_equity" in today_metrics:
+        print(f"\n  Alpaca OPEN:    ${today_metrics['open_equity']:,.0f}  "
+              f"day P&L ${today_metrics.get('open_daily_pnl', 0):+,.0f}")
+    if "delayed_equity" in today_metrics:
+        print(f"  Alpaca DELAYED: ${today_metrics['delayed_equity']:,.0f}  "
+              f"day P&L ${today_metrics.get('delayed_daily_pnl', 0):+,.0f}")
+    if "open_equity" in today_metrics:
+        print(f"\n  Alpaca OPEN:    ${today_metrics['open_equity']:,.0f}  "
+              f"day P&L ${today_metrics.get('open_daily_pnl', 0):+,.0f}")
+    if "delayed_equity" in today_metrics:
+        print(f"  Alpaca DELAYED: ${today_metrics['delayed_equity']:,.0f}  "
+              f"day P&L ${today_metrics.get('delayed_daily_pnl', 0):+,.0f}")
 
     alert = rolling_precision_alert(metrics_df)
     if alert:

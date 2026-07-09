@@ -1,7 +1,7 @@
 name: Daily Validation
 
 on:
-  # Triggered by Cloudflare Worker cron at 4:30 PM ET, or manual dispatch
+  # Triggered by Cloudflare Worker cron at 3:55 PM ET, or manual dispatch
   workflow_dispatch:
 
 jobs:
