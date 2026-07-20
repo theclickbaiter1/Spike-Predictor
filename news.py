@@ -174,14 +174,19 @@ def filter_articles_for_date(articles: list[dict], date) -> list[dict]:
 
 
 def compute_sentiment_from_scores(scores: list[float]) -> dict:
-    """Compute the 5 sentiment features from pre-computed score values."""
+    """Compute sentiment features from pre-computed score values.
+
+    When there are no headlines, mean/max/min/std are NaN (missing), not 0
+    (neutral). `has_overnight_news` disentangles the two for the model.
+    """
     if not scores:
         return {
-            "overnight_sentiment_mean": 0.0,
-            "overnight_sentiment_max": 0.0,
-            "overnight_sentiment_min": 0.0,
+            "overnight_sentiment_mean": float("nan"),
+            "overnight_sentiment_max": float("nan"),
+            "overnight_sentiment_min": float("nan"),
             "overnight_news_count": 0,
-            "overnight_sentiment_std": 0.0,
+            "overnight_sentiment_std": float("nan"),
+            "has_overnight_news": 0,
         }
     arr = np.array(scores)
     return {
@@ -190,6 +195,7 @@ def compute_sentiment_from_scores(scores: list[float]) -> dict:
         "overnight_sentiment_min": float(np.min(arr)),
         "overnight_news_count": len(arr),
         "overnight_sentiment_std": float(np.std(arr)),
+        "has_overnight_news": 1,
     }
 
 
@@ -276,24 +282,17 @@ def compute_sentiment_features(
         if a.get("headline", "").strip()
     ]
 
-    # Default features when no news is available
     defaults = {
-        "overnight_sentiment_mean": 0.0,
-        "overnight_sentiment_max": 0.0,
-        "overnight_sentiment_min": 0.0,
+        "overnight_sentiment_mean": float("nan"),
+        "overnight_sentiment_max": float("nan"),
+        "overnight_sentiment_min": float("nan"),
         "overnight_news_count": 0,
-        "overnight_sentiment_std": 0.0,
+        "overnight_sentiment_std": float("nan"),
+        "has_overnight_news": 0,
     }
 
     if not headlines:
         return defaults
 
     scores = scorer.score_headlines(headlines)
-
-    return {
-        "overnight_sentiment_mean": float(np.mean(scores)),
-        "overnight_sentiment_max": float(np.max(scores)),
-        "overnight_sentiment_min": float(np.min(scores)),
-        "overnight_news_count": len(scores),
-        "overnight_sentiment_std": float(np.std(scores)),
-    }
+    return compute_sentiment_from_scores(list(scores))

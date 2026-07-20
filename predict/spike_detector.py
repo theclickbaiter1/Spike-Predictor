@@ -166,9 +166,12 @@ def data_quality_report(X, y, intraday_ret):
         print(f"\n  ⚠ {len(all_zero_features)} dead feature(s): {', '.join(all_zero_features[:5])}"
               f"{'...' if len(all_zero_features) > 5 else ''}")
 
-    # Known issue: days_to_earnings — now point-in-time (historical only)
+    # Known issue: days_to_earnings is days-since last print; skip uses days_to_next_earnings
     if "days_to_earnings" in X.columns:
-        print(f"\n  ℹ 'days_to_earnings' uses reported historical earnings only (no lookahead).")
+        print(
+            "\n  ℹ 'days_to_earnings' = days since last report (model feature). "
+            "Trade skip uses 'days_to_next_earnings'."
+        )
 
     print("─" * 65 + "\n")
 
@@ -525,7 +528,11 @@ def run_predict():
             "calibrator_bypassed": bool(r.get("calibrator_bypassed", False)),
             "coupling_alignment": row.get("coupling_alignment", 0),
             "gap_sentiment_agreement": row.get("gap_sentiment_agreement", 0),
+            "overnight_sentiment_mean": row.get("overnight_sentiment_mean", 0),
+            "overnight_news_count": row.get("overnight_news_count", 0),
+            "has_overnight_news": row.get("has_overnight_news", 0),
             "days_to_earnings": row.get("days_to_earnings", 99),
+            "days_to_next_earnings": row.get("days_to_next_earnings", 99),
             "is_earnings_day": row.get("is_earnings_day", 0),
             "top_signal": determine_top_signal(row),
         })
@@ -536,7 +543,9 @@ def run_predict():
             "ticker", "p_spike", "p_spike_raw", "p_spike_trade",
             "expected_abs_return", "expected_signed_return", "expected_value",
             "p_up", "p_down", "p_flat", "calibrator_bypassed",
-            "coupling_alignment", "top_signal",
+            "coupling_alignment", "gap_sentiment_agreement",
+            "overnight_sentiment_mean", "overnight_news_count", "has_overnight_news",
+            "days_to_next_earnings", "top_signal",
         ])
     else:
         results_df = pd.DataFrame(results).sort_values("p_spike_trade", ascending=False)

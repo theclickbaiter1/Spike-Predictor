@@ -92,6 +92,10 @@ OPTIONAL_FILL_COLS = [
     "dxy_change_5d", "crude_oil_change_5d", "gold_change_5d",
     "treasury_10y_delta_5d", "sp500_return_3d",
     "susceptibility_proxy", "criticality_proxy",
+    # Missing news → NaN sentiment; 0-fill for XGB, use has_overnight_news to tell apart
+    "overnight_sentiment_mean", "overnight_sentiment_max",
+    "overnight_sentiment_min", "overnight_sentiment_std",
+    "has_overnight_news",
 ]
 
 
@@ -144,10 +148,11 @@ def compute_technical_features(ohlcv: pd.DataFrame) -> pd.DataFrame:
     close, high, low, volume, open_ = df["Close"], df["High"], df["Low"], df["Volume"], df["Open"]
     f = pd.DataFrame(index=df.index)
     f["prev_close"] = close.shift(1)
-    f["rsi_14"] = _compute_rsi(close, 14)
-    f["ema_10"] = close.ewm(span=10, adjust=False).mean()
-    f["realized_vol_20d"] = close.pct_change().rolling(20).std() * np.sqrt(252)
-    f["avg_volume_10d"] = volume.rolling(10).mean()
+    # Lag indicators off day-T close/volume so open→close labels don't see same-day leakage.
+    f["rsi_14"] = _compute_rsi(close, 14).shift(1)
+    f["ema_10"] = close.ewm(span=10, adjust=False).mean().shift(1)
+    f["realized_vol_20d"] = (close.pct_change().rolling(20).std() * np.sqrt(252)).shift(1)
+    f["avg_volume_10d"] = volume.rolling(10).mean().shift(1)
     f["prev_day_return"] = ((close - open_) / open_).shift(1)
     f["prev_day_range"] = ((high - low) / close).shift(1)
     f["gap_3d"] = close.pct_change(3).shift(1)
@@ -338,9 +343,18 @@ def _download_safe(ticker: str, start: str, end: str, retries: int = 3) -> pd.Da
                 auto_adjust=True,
             )
             if isinstance(data.columns, pd.MultiIndex):
-                data.columns = data.columns.droplevel(1)
+                lvl0 = [str(x).lower() for x in data.columns.get_level_values(0)]
+                if any(k in lvl0 for k in ("open", "high", "low", "close", "adj close", "volume")):
+                    data.columns = data.columns.droplevel(1)
+                else:
+                    data.columns = data.columns.droplevel(0)
             if not data.empty and len(data) >= 5:
-                return data
+                data = data.rename(columns={"Adj Close": "Close"})
+                need = [c for c in ("Open", "High", "Low", "Close") if c in data.columns]
+                if need:
+                    data = data.dropna(subset=need)
+                if len(data) >= 5 and "Close" in data.columns and int(data["Close"].notna().sum()) >= 5:
+                    return data
 
             # Fallback: Ticker.history (often succeeds when download() fails)
             hist = yf.Ticker(ticker).history(
@@ -349,9 +363,18 @@ def _download_safe(ticker: str, start: str, end: str, retries: int = 3) -> pd.Da
                 auto_adjust=True,
             )
             if isinstance(hist.columns, pd.MultiIndex):
-                hist.columns = hist.columns.droplevel(1)
+                lvl0 = [str(x).lower() for x in hist.columns.get_level_values(0)]
+                if any(k in lvl0 for k in ("open", "high", "low", "close", "adj close", "volume")):
+                    hist.columns = hist.columns.droplevel(1)
+                else:
+                    hist.columns = hist.columns.droplevel(0)
             if not hist.empty:
-                return hist
+                hist = hist.rename(columns={"Adj Close": "Close"})
+                need = [c for c in ("Open", "High", "Low", "Close") if c in hist.columns]
+                if need:
+                    hist = hist.dropna(subset=need)
+                if len(hist) >= 5 and "Close" in hist.columns and int(hist["Close"].notna().sum()) >= 5:
+                    return hist
         except Exception as e:
             if attempt == retries - 1:
                 print(f"  ⚠ yfinance download failed for {ticker}: {e}")
@@ -388,17 +411,31 @@ def _download_alpaca_bars(ticker: str, start_ts: pd.Timestamp, end_ts: pd.Timest
         if not bars:
             return pd.DataFrame()
         df = pd.DataFrame(bars)
+        # Support both compact (o/h/l/c) and verbose Alpaca schemas.
+        colmap = {
+            "Open": "o" if "o" in df.columns else ("open" if "open" in df.columns else None),
+            "High": "h" if "h" in df.columns else ("high" if "high" in df.columns else None),
+            "Low": "l" if "l" in df.columns else ("low" if "low" in df.columns else None),
+            "Close": "c" if "c" in df.columns else ("close" if "close" in df.columns else None),
+            "Volume": "v" if "v" in df.columns else ("volume" if "volume" in df.columns else None),
+        }
+        if any(v is None for v in colmap.values()) or "t" not in df.columns:
+            return pd.DataFrame()
         df["t"] = pd.to_datetime(df["t"]).dt.tz_convert(None).dt.normalize()
         out = pd.DataFrame(
             {
-                "Open": df["o"].astype(float),
-                "High": df["h"].astype(float),
-                "Low": df["l"].astype(float),
-                "Close": df["c"].astype(float),
-                "Volume": df["v"].astype(float),
+                "Open": pd.to_numeric(df[colmap["Open"]], errors="coerce"),
+                "High": pd.to_numeric(df[colmap["High"]], errors="coerce"),
+                "Low": pd.to_numeric(df[colmap["Low"]], errors="coerce"),
+                "Close": pd.to_numeric(df[colmap["Close"]], errors="coerce"),
+                "Volume": pd.to_numeric(df[colmap["Volume"]], errors="coerce"),
             },
             index=df["t"],
         ).sort_index()
+        out = out.dropna(subset=["Open", "Close"])
+        # Reject unusable frames so callers fall back to yfinance.
+        if out.empty or int(out["Close"].notna().sum()) < 5:
+            return pd.DataFrame()
         return out
     except Exception:
         return pd.DataFrame()
@@ -519,10 +556,13 @@ def compute_calendar_features(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFr
     cal["day_of_week"] = dates.dayofweek
     cal["is_monday"] = (dates.dayofweek == 0).astype(int)
     cal["is_friday"] = (dates.dayofweek == 4).astype(int)
-    cal["days_to_earnings"] = 90  # Default: no known upcoming earnings
+    # Historical column name is misleading: this is days SINCE last reported print
+    # (capped). Kept for model compatibility; trade skip uses days_to_next_earnings.
+    cal["days_to_earnings"] = 90
+    cal["days_to_next_earnings"] = 90  # upcoming; used by trade filters (not in XGB yet)
     cal["is_earnings_day"] = 0
 
-    # Point-in-time: only use reported historical earnings (no yfinance future dates).
+    # Point-in-time: reported history for since/is_day; future scheduled for next.
     earnings_data = _fetch_earnings_data(ticker)
     earnings_dates_list = []
     for rec in earnings_data:
@@ -538,21 +578,24 @@ def compute_calendar_features(ticker: str, dates: pd.DatetimeIndex) -> pd.DataFr
 
     for idx, d in enumerate(dates):
         d_norm = pd.Timestamp(d).normalize()
-        # Only earnings already reported on or before d_norm (no lookahead)
         known = earnings_dates[earnings_dates <= d_norm]
-        if len(known) == 0:
-            continue
+        upcoming = earnings_dates[earnings_dates > d_norm]
 
-        if d_norm in known:
-            cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
-            cal.iloc[idx, cal.columns.get_loc("days_to_earnings")] = 0
-        else:
-            days_since = (d_norm - known[-1]).days
-            cal.iloc[idx, cal.columns.get_loc("days_to_earnings")] = min(days_since, 90)
+        if len(known) > 0:
+            if d_norm in known:
+                cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
+                cal.iloc[idx, cal.columns.get_loc("days_to_earnings")] = 0
+            else:
+                days_since = (d_norm - known[-1]).days
+                cal.iloc[idx, cal.columns.get_loc("days_to_earnings")] = min(days_since, 90)
 
-        yesterday_was_earnings = earnings_dates[earnings_dates == d_norm - timedelta(days=1)]
-        if len(yesterday_was_earnings) > 0:
-            cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
+            yesterday_was_earnings = earnings_dates[earnings_dates == d_norm - timedelta(days=1)]
+            if len(yesterday_was_earnings) > 0:
+                cal.iloc[idx, cal.columns.get_loc("is_earnings_day")] = 1
+
+        if len(upcoming) > 0:
+            days_next = (upcoming[0] - d_norm).days
+            cal.iloc[idx, cal.columns.get_loc("days_to_next_earnings")] = min(int(days_next), 90)
 
     return cal
 
@@ -594,6 +637,12 @@ def _normalize_earnings_records(records: list[dict]) -> list[dict]:
     return parsed
 
 
+# Sector ETF tickers have no company earnings; skip yfinance quoteSummary 404 spam.
+_SECTOR_ETF_TICKERS = frozenset({
+    "SMH", "QTUM", "XLK", "XLF", "XLE", "XBI", "XLY", "XLI",
+})
+
+
 def _fetch_earnings_data(ticker: str) -> list[dict]:
     """
     Fetch earnings history for a ticker via yfinance. Returns a list of dicts
@@ -603,6 +652,14 @@ def _fetch_earnings_data(ticker: str) -> list[dict]:
     import json
 
     cache_path = EARNINGS_CACHE_DIR / f"{ticker}_earnings.json"
+    if ticker in _SECTOR_ETF_TICKERS:
+        # Cache empty so calendar/earnings features stay zero without API calls.
+        if not cache_path.exists():
+            EARNINGS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, "w") as f:
+                json.dump([], f)
+        return []
+
     if cache_path.exists():
         with open(cache_path, "r") as f:
             cached = json.load(f)
@@ -1022,6 +1079,13 @@ def build_training_dataset(
     tickers = combined["_ticker"]
 
     valid_mask = X.notna().all(axis=1) & y.notna()
+    if int(valid_mask.sum()) == 0 and len(X) > 0:
+        nan_frac = X.isna().mean().sort_values(ascending=False)
+        print("  ⚠ All rows dropped by NaN mask. Top missing columns:")
+        for col, frac in nan_frac.head(12).items():
+            if frac > 0:
+                print(f"      {col}: {frac:.1%} NaN")
+
     X = X[valid_mask]
     y = y[valid_mask].astype(int)
     intraday_ret = intraday_ret[valid_mask]
@@ -1030,8 +1094,9 @@ def build_training_dataset(
 
     print(f"\n  Dataset built: {len(X)} rows × {len(FEATURE_COLUMNS)} features")
     for label_idx, name in enumerate(["spike_down", "flat", "spike_up"]):
-        count = (y == label_idx).sum()
-        print(f"    {name}: {count} ({count/len(y)*100:.1f}%)")
+        count = (y == label_idx).sum() if len(y) else 0
+        pct = (count / len(y) * 100) if len(y) else 0.0
+        print(f"    {name}: {count} ({pct:.1f}%)")
 
     return X, y, intraday_ret, tickers, adaptive_thresh
 

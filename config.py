@@ -46,8 +46,11 @@ VIX_MID_MAX = 25.0
 DIRECTION_MARGIN_MIN = 0.18        # min max(p_up,p_down)/p_spike to trade direction
 SECTOR_AGREEMENT_REQUIRED = True # coupling_alignment sign must match direction
 REQUIRE_GAP_SENTIMENT_AGREEMENT = True  # gap direction must agree with overnight sentiment
+# Research sprint (hist_sent_align_th055): only trade when overnight news sentiment
+# has the same sign as the trade direction (LONG ⇒ sent>0, SHORT ⇒ sent<0).
+REQUIRE_SENTIMENT_DIRECTION_ALIGNMENT = True
 SKIP_TRADE_VIX_ABOVE = 25.0      # no new entries when VIX at/above this level
-SKIP_TRADE_NEAR_EARNINGS_DAYS = 1  # skip if days_to_earnings <= N or is_earnings_day
+SKIP_TRADE_NEAR_EARNINGS_DAYS = 1  # skip if days_to_next_earnings <= N or is_earnings_day
 MIN_TRADE_THRESHOLD = 0.75       # floor — never trade below this even if tuned lower
 MIN_TUNED_PRECISION = 0.40       # threshold tuning target precision on tune slice
 TUNED_THRESHOLD_PATH = DATA_DIR / "tuned_threshold.json"
@@ -240,11 +243,11 @@ CATALYST_COLUMNS = [
 ]
 
 FEATURE_COLUMNS = [
-    # Sentiment (7)
+    # Sentiment (8)
     "overnight_sentiment_mean", "overnight_sentiment_max",
     "overnight_sentiment_min", "overnight_news_count", "overnight_sentiment_std",
-    "news_count_z_score", "news_spike",
-    # Technical (10)
+    "news_count_z_score", "news_spike", "has_overnight_news",
+    # Technical (15) — rsi/ema/vol/avg_vol are lagged off day-T
     "prev_close", "rsi_14", "ema_10", "realized_vol_20d", "avg_volume_10d",
     "prev_day_return", "prev_day_range", "gap_3d", "overnight_gap",
     "vol_z_score", "ret_1d", "ret_5d", "ret_10d", "momentum_slope_5d",

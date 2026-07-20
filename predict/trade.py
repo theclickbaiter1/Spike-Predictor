@@ -46,6 +46,7 @@ from config import (
     MODEL_PATH,
     OUTPUT_DIR,
     REQUIRE_GAP_SENTIMENT_AGREEMENT,
+    REQUIRE_SENTIMENT_DIRECTION_ALIGNMENT,
     SECTOR_AGREEMENT_REQUIRED,
     SKIP_TRADE_NEAR_EARNINGS_DAYS,
     SKIP_TRADE_VIX_ABOVE,
@@ -289,11 +290,58 @@ def log_trades(trades, label: str = "open"):
 
 # ── Signal Generation ────────────────────────────────────────────────────────
 
+def sentiment_aligns_with_direction(
+    direction: str,
+    overnight_sentiment_mean,
+    overnight_news_count=None,
+    has_overnight_news=None,
+) -> bool:
+    """
+    True when overnight news sentiment has the same sign as the trade direction.
+    Requires at least one headline; neutral (0) / missing does not align.
+    """
+    has_flag = has_overnight_news is not None and not (
+        isinstance(has_overnight_news, float) and pd.isna(has_overnight_news)
+    )
+    has_count = overnight_news_count is not None and not (
+        isinstance(overnight_news_count, float) and pd.isna(overnight_news_count)
+    )
+
+    if has_flag:
+        if int(has_overnight_news) != 1:
+            return False
+    elif has_count:
+        if int(overnight_news_count) < 1:
+            return False
+    else:
+        # Legacy watchlists: non-zero |sent| is weak evidence of news
+        if overnight_sentiment_mean is None or (
+            isinstance(overnight_sentiment_mean, float) and pd.isna(overnight_sentiment_mean)
+        ):
+            return False
+        if float(overnight_sentiment_mean) == 0.0:
+            return False
+
+    if overnight_sentiment_mean is None or (
+        isinstance(overnight_sentiment_mean, float) and pd.isna(overnight_sentiment_mean)
+    ):
+        return False
+    sent = float(overnight_sentiment_mean)
+    if direction == "LONG":
+        return sent > 0
+    if direction == "SHORT":
+        return sent < 0
+    return False
+
+
 def passes_direction_gates(
     prob_row,
     direction: str,
     coupling_alignment: float,
     gap_sentiment_agreement: float | None = None,
+    overnight_sentiment_mean=None,
+    overnight_news_count=None,
+    has_overnight_news=None,
 ) -> bool:
     """Direction confidence + sector magnetization + gap/sentiment agreement."""
     p_spike = float(prob_row.get("p_spike_trade", prob_row["p_spike"]))
@@ -311,6 +359,14 @@ def passes_direction_gates(
     if REQUIRE_GAP_SENTIMENT_AGREEMENT and gap_sentiment_agreement is not None:
         if float(gap_sentiment_agreement or 0) < 1:
             return False
+    if REQUIRE_SENTIMENT_DIRECTION_ALIGNMENT:
+        if not sentiment_aligns_with_direction(
+            direction,
+            overnight_sentiment_mean,
+            overnight_news_count=overnight_news_count,
+            has_overnight_news=has_overnight_news,
+        ):
+            return False
     return True
 
 
@@ -318,8 +374,12 @@ def passes_entry_filters(feature_row, vix: float | None) -> bool:
     """Macro and calendar gates for new entries."""
     if vix is not None and pd.notna(vix) and float(vix) >= SKIP_TRADE_VIX_ABOVE:
         return False
-    days = feature_row.get("days_to_earnings", 99)
-    if days is not None and pd.notna(days) and int(days) <= SKIP_TRADE_NEAR_EARNINGS_DAYS:
+    # Prefer upcoming distance (days_to_next_earnings). Do NOT use the misnamed
+    # days_to_earnings column here — that field is days-since last print.
+    days_next = feature_row.get("days_to_next_earnings")
+    if days_next is None or (isinstance(days_next, float) and pd.isna(days_next)):
+        days_next = 99
+    if int(days_next) <= SKIP_TRADE_NEAR_EARNINGS_DAYS:
         return False
     if int(feature_row.get("is_earnings_day", 0) or 0) == 1:
         return False
@@ -418,7 +478,16 @@ def generate_signals():
         direction = "LONG" if r["p_up"] > r["p_down"] else "SHORT"
         coupling = float(row.get("coupling_alignment", 0) or 0)
         gap_agree = row.get("gap_sentiment_agreement")
-        if not passes_direction_gates(r, direction, coupling, gap_agree):
+        sent_mean = row.get("overnight_sentiment_mean")
+        if not passes_direction_gates(
+            r,
+            direction,
+            coupling,
+            gap_agree,
+            overnight_sentiment_mean=sent_mean,
+            overnight_news_count=row.get("overnight_news_count"),
+            has_overnight_news=row.get("has_overnight_news"),
+        ):
             continue
         edge = expected_edge(r)
         if model.return_model is not None and edge < EV_MIN_EDGE:
@@ -432,6 +501,7 @@ def generate_signals():
             "p_spike_trade": p_trade,
             "p_dir": float(p_dir),
             "coupling_alignment": coupling,
+            "overnight_sentiment_mean": float(sent_mean) if sent_mean is not None and pd.notna(sent_mean) else 0.0,
             "expected_signed_return": float(r.get("expected_signed_return", 0) or 0),
             "expected_value": edge,
         })
@@ -463,6 +533,13 @@ def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
     ev_gate_active = "expected_signed_return" in df.columns
     if not ev_gate_active:
         print("  ℹ Watchlist has no magnitude columns — EV gate skipped (retrain for EV sizing).")
+    has_sent = "overnight_sentiment_mean" in df.columns
+    if REQUIRE_SENTIMENT_DIRECTION_ALIGNMENT and not has_sent:
+        print(
+            "  ⚠ Watchlist missing overnight_sentiment_mean — "
+            "sentiment-alignment gate cannot run; no entries from this file."
+        )
+        return []
     signals = []
     for _, r in df.iterrows():
         p_trade = float(r.get(prob_col, r["p_spike"]))
@@ -472,7 +549,18 @@ def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
             direction = "LONG" if r["p_up"] > r["p_down"] else "SHORT"
             coupling = float(r.get("coupling_alignment", 0) or 0)
             gap_agree = r.get("gap_sentiment_agreement") if "gap_sentiment_agreement" in r.index else None
-            if not passes_direction_gates(r, direction, coupling, gap_agree):
+            sent_mean = r.get("overnight_sentiment_mean") if has_sent else None
+            news_count = r.get("overnight_news_count") if "overnight_news_count" in r.index else None
+            has_news = r.get("has_overnight_news") if "has_overnight_news" in r.index else None
+            if not passes_direction_gates(
+                r,
+                direction,
+                coupling,
+                gap_agree,
+                overnight_sentiment_mean=sent_mean,
+                overnight_news_count=news_count,
+                has_overnight_news=has_news,
+            ):
                 continue
             # Always recompute net edge (watchlists may store gross EV from older runs).
             edge = expected_edge(r)
@@ -485,6 +573,7 @@ def load_signals_from_watchlist(csv_path: Path) -> list[dict]:
                 "p_spike_raw": float(r.get("p_spike_raw", r["p_spike"])),
                 "p_spike_trade": p_trade,
                 "p_dir": float(max(r["p_up"], r["p_down"])),
+                "overnight_sentiment_mean": float(sent_mean) if sent_mean is not None and pd.notna(sent_mean) else 0.0,
                 "expected_signed_return": float(r.get("expected_signed_return", 0) or 0),
                 "expected_value": edge,
             })

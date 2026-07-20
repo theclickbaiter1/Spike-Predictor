@@ -154,17 +154,22 @@ def pick_regime_thresholds(
         }
 
     vix = X_tune["vix"]
-    buckets = {
-        "vix_low": X_tune[vix < VIX_LOW_MAX],
-        "vix_mid": X_tune[(vix >= VIX_LOW_MAX) & (vix < VIX_MID_MAX)],
-        "vix_high": X_tune[vix >= VIX_MID_MAX],
+    # Boolean masks (not .loc on DatetimeIndex): training rows share dates across
+    # tickers, so index-based lookup explodes y vs X lengths.
+    bucket_masks = {
+        "vix_low": vix < VIX_LOW_MAX,
+        "vix_mid": (vix >= VIX_LOW_MAX) & (vix < VIX_MID_MAX),
+        "vix_high": vix >= VIX_MID_MAX,
     }
-    y_tune = y_tune.loc[X_tune.index]
+    y_tune = y_tune.iloc[: len(X_tune)]
+    if len(y_tune) != len(X_tune):
+        raise ValueError(f"X/y length mismatch for regime tune: {len(X_tune)} vs {len(y_tune)}")
     regime = {}
-    for name, X_b in buckets.items():
+    for name, mask in bucket_masks.items():
+        X_b = X_tune.loc[mask]
         if len(X_b) < 50:
             continue
-        y_b = y_tune.loc[X_b.index]
+        y_b = y_tune.loc[mask]
         regime[name] = pick_best_threshold(model, X_b, y_b)
 
     default = pick_best_threshold(model, X_tune, y_tune)
@@ -368,12 +373,26 @@ def quick_holdout_signal_pnl(
     probs = model.predict_for_trade(X_h)
     signed = []
     for idx in X_h.index:
+        # Training frames use a shared DatetimeIndex across tickers; use positional lookup.
         r = probs.loc[idx]
-        p_trade = float(r.get("p_spike_trade", r["p_spike"]))
-        if p_trade < threshold:
-            continue
-        direction = 1 if r["p_up"] > r["p_down"] else -1
-        signed.append(float(rets.loc[idx]) * direction)
+        if isinstance(r, pd.DataFrame):
+            # Duplicate index: evaluate each row
+            rows = [r.iloc[i] for i in range(len(r))]
+            ret_vals = rets.loc[idx]
+            if isinstance(ret_vals, pd.Series):
+                ret_list = ret_vals.tolist()
+            else:
+                ret_list = [float(ret_vals)] * len(rows)
+        else:
+            rows = [r]
+            ret_vals = rets.loc[idx]
+            ret_list = [float(ret_vals.iloc[0]) if isinstance(ret_vals, pd.Series) else float(ret_vals)]
+        for i, row in enumerate(rows):
+            p_trade = float(row.get("p_spike_trade", row["p_spike"]))
+            if p_trade < threshold:
+                continue
+            direction = 1 if row["p_up"] > row["p_down"] else -1
+            signed.append(float(ret_list[min(i, len(ret_list) - 1)]) * direction)
     if not signed:
         return float("nan")
     return float(np.mean(signed))

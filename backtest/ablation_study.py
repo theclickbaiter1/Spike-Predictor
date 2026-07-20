@@ -24,8 +24,9 @@ from stat_mech.ising import sign_returns_from_training
 
 FEATURE_GROUPS = {
     "sentiment": [
-        "overnight_sentiment_mean", "overnight_sentiment_max", "overnight_sentiment_min",
-        "overnight_news_count", "overnight_sentiment_std", "news_count_z_score", "news_spike",
+        "overnight_sentiment_mean", "overnight_sentiment_max",
+        "overnight_sentiment_min", "overnight_news_count", "overnight_sentiment_std",
+        "news_count_z_score", "news_spike", "has_overnight_news",
     ],
     "technical": [
         "prev_close", "rsi_14", "ema_10", "realized_vol_20d", "avg_volume_10d",
@@ -37,7 +38,9 @@ FEATURE_GROUPS = {
         "vix_change_3d", "vix_change_5d", "vix_regime", "dxy_change_5d", "crude_oil_change_5d",
         "gold_change_5d", "treasury_10y_delta_5d", "sp500_return_3d",
     ],
-    "calendar": ["day_of_week", "is_monday", "is_friday", "days_to_earnings", "is_earnings_day"],
+    "calendar": [
+        "day_of_week", "is_monday", "is_friday", "days_to_earnings", "is_earnings_day",
+    ],
     "earnings": [
         "eps_surprise_last", "revenue_surprise_last", "earnings_streak",
         "post_earnings_drift_1d", "earnings_volatility",
