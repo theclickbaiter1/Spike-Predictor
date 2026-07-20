@@ -7,7 +7,8 @@ on:
 jobs:
   weekly-validate:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # Full dataset rebuild + FinBERT can exceed 2h when caches are cold.
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repo
@@ -20,13 +21,34 @@ jobs:
           cache: "pip"
 
       - name: Cache news + earnings data
+        id: cache-spike-data
         uses: actions/cache@v4
         with:
           path: |
             data/news_cache
             data/earnings_cache
+          # Stable prefix so cold runs after a cancel still warm-start.
           key: spike-data-cache-${{ github.run_id }}
-          restore-keys: spike-data-cache-
+          restore-keys: |
+            spike-data-cache-
+
+      - name: Cache training parquet (optional fast path)
+        id: cache-training-parquet
+        uses: actions/cache@v4
+        with:
+          path: data/training_data.parquet
+          key: training-parquet-${{ github.run_id }}
+          restore-keys: |
+            training-parquet-
+
+      - name: Cache HuggingFace / FinBERT weights
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+          key: hf-cache-${{ runner.os }}-py311
+          restore-keys: |
+            hf-cache-${{ runner.os }}-
 
       - name: Cache Telegram subscribers
         uses: actions/cache@v4
@@ -48,6 +70,7 @@ jobs:
       - name: Run weekly OOS validation
         env:
           FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+        # Prefer cached parquet when present; fall back to full rebuild.
         run: python backtest/validate_week.py
 
       - name: Weekly precision gate
@@ -75,6 +98,23 @@ jobs:
         with:
           path: output/validation_state/weekly
           key: weekly-validation-${{ github.run_id }}
+
+      # Persist data caches even on cancel/timeout so the next run is faster.
+      - name: Save news + earnings cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/news_cache
+            data/earnings_cache
+          key: spike-data-cache-${{ github.run_id }}
+
+      - name: Save training parquet cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data/training_data.parquet
+          key: training-parquet-${{ github.run_id }}
 
       - name: Notify Telegram on failure
         if: failure()

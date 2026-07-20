@@ -40,14 +40,48 @@ def classify_return(ret, ticker, date_str):
 
 # ── Phase 1: Train on data up to May 9 ──────────────────────────────────────
 
-def train_model(train_until):
-    from features import build_training_dataset
-    from model import TwoStageModel, time_series_split
-    from news import FinBERTScorer, FinnhubClient
+def train_model(train_until, rebuild_dataset: bool = False):
+    """Train for weekly OOS.
+
+    Prefer cached ``training_data.parquet`` (CI restores this) so we do not
+    rebuild 60 tickers of news/FinBERT every Saturday. Fall back to a full
+    ``build_training_dataset`` when parquet is missing or ``--rebuild-dataset``.
+    """
+    from config import TRAINING_DATA_PATH
 
     print("=" * 65)
     print(f"  PHASE 1: TRAINING (data up to {train_until})")
     print("=" * 65)
+
+    use_parquet = (not rebuild_dataset) and TRAINING_DATA_PATH.exists()
+    if use_parquet:
+        from walkforward_utils import load_training_df, train_model_fast
+
+        df = load_training_df(train_until)
+        if len(df) < 1000:
+            print(
+                f"  ⚠ Cached parquet only has {len(df)} rows ≤ {train_until} — "
+                "falling back to full rebuild."
+            )
+            use_parquet = False
+        else:
+            print(
+                f"  Using cached {TRAINING_DATA_PATH.name}: "
+                f"{len(df)} rows × {len(FEATURE_COLUMNS)} features"
+            )
+            model = train_model_fast(train_until, df=df)
+            print("\n  Top 10 Spike Feature Importances:")
+            importance = model.get_spike_feature_importance()
+            for feat, score in importance.head(10).items():
+                bar = "█" * int(score * 100)
+                print(f"    {feat:30s} {score:.3f} {bar}")
+            model.save()
+            print("\n  ✅ Model saved (fast path).\n")
+            return model
+
+    from features import build_training_dataset
+    from model import TwoStageModel, time_series_split
+    from news import FinBERTScorer, FinnhubClient
 
     client = FinnhubClient()
     scorer = FinBERTScorer()
@@ -310,6 +344,11 @@ if __name__ == "__main__":
     parser.add_argument("--train-until", type=str, default=None, help="Last date for training data (YYYY-MM-DD)")
     parser.add_argument("--test-start", type=str, default=None, help="First test date (YYYY-MM-DD)")
     parser.add_argument("--test-end", type=str, default=None, help="Last test date (YYYY-MM-DD)")
+    parser.add_argument(
+        "--rebuild-dataset",
+        action="store_true",
+        help="Force full universe rebuild instead of using training_data.parquet",
+    )
     args = parser.parse_args()
 
     if args.train_until and args.test_start and args.test_end:
@@ -318,7 +357,7 @@ if __name__ == "__main__":
         train_until, test_start, test_end = _default_dates()
         print(f"  Using default dates: train ≤ {train_until}, test {test_start} → {test_end}")
 
-    model = train_model(train_until)
+    model = train_model(train_until, rebuild_dataset=args.rebuild_dataset)
     results = predict_and_compare(model, test_start, test_end)
     if len(results) > 0:
         print_summary(results)
